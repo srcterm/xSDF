@@ -20,18 +20,17 @@ import sys
 from typing import Dict, Optional
 import importlib.util, os
 
-import stretch_helper
-import plot_utils
+from src import stretch_helper, plot_utils
 
 # ---- Load torch SDF backend ----
-_TORCH_SDF_FILE = os.path.join(os.path.dirname(__file__), "torch-meshSDF.py")
+_TORCH_SDF_FILE = os.path.join(os.path.dirname(__file__), "src", "torch-meshSDF.py")
 _spec = importlib.util.spec_from_file_location("torch_meshSDF", _TORCH_SDF_FILE)
 torch_meshSDF = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(torch_meshSDF)
 
 # ---- Load Trimesh SDF backend (fallback) ----
 import trimesh
-_TRIMESH_SDF_FILE = os.path.join(os.path.dirname(__file__), "trimesh-meshSDF.py")
+_TRIMESH_SDF_FILE = os.path.join(os.path.dirname(__file__), "src", "trimesh-meshSDF.py")
 _spec2 = importlib.util.spec_from_file_location("trimesh_meshSDF", _TRIMESH_SDF_FILE)
 trimesh_meshSDF = importlib.util.module_from_spec(_spec2)
 _spec2.loader.exec_module(trimesh_meshSDF)

@@ -1,1 +1,3 @@
 hydrofoil_original.ply
+*.pyc
+*.h5
