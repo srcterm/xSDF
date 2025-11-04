@@ -1,8 +1,6 @@
 # Set MPS fallback policy before importing torch
 import os
 import numpy as np
-# Only disable MPS fallback if we actually choose MPS later (set in mesh_to_sdf_torch)
-# sdf_pytorch_accel.py  —  Torch-only SDF with uniform-grid triangle accelerator
 import math, torch
 from dataclasses import dataclass
 from typing import Tuple, Optional
@@ -20,7 +18,6 @@ def pick_device(prefer: Optional[str] = None) -> torch.device:
             return torch.device("mps")
         if pref.startswith("cuda") and torch.cuda.is_available():
             return torch.device("cuda")
-        # fall back to cpu if requested device unavailable
         return torch.device("cpu")
 
     # Auto-pick when not specified
@@ -191,19 +188,15 @@ def estimate_memory_and_chunks(total_pts: int, total_tris: int, device: torch.de
     # Strategy: Keep tri_chunk SMALL for cache efficiency and less memory overhead.
     # The (N,T) arrays are the bottleneck, so prefer large N (pts) and small T (tris).
 
-    # Keep triangle chunk small (like old behavior)
-    # Old formula: tri_chunk = max(2000, min(60000, int(0.03 * total_tris)))
     tri_chunk = max(2_000, min(10_000, int(0.03 * total_tris)))
 
-    # Use the old memory model which worked well:
-    # Memory ≈ pts_chunk × tri_chunk × 48 floats × 4 bytes
-    # With 80% of available memory
+    # Memory ≈ pts_chunk × tri_chunk × 48 floats × 4 bytes with 80% of available memory
     bytes_per_float = 4
-    floats_per_pair = 48  # Conservative estimate from old code
+    floats_per_pair = 48 
     usable_bytes = int(available_bytes * 0.8)  # Use 80% to leave headroom
 
     pts_chunk = int(usable_bytes / (tri_chunk * floats_per_pair * bytes_per_float))
-    pts_chunk = max(2_000, min(pts_chunk, total_pts))  # Lower minimum for memory-constrained scenarios
+    pts_chunk = max(2_000, min(pts_chunk, total_pts))  # Lower minimum for memory-constrained scenarios, maybe should be automated..
 
     # Estimate actual memory usage
     memory_used = pts_chunk * tri_chunk * floats_per_pair * bytes_per_float
@@ -250,7 +243,7 @@ def dynamic_chunking(
         total_pts - processed, total_tris, device, target_memory_gb
     )
 
-    # Only reduce chunk size if memory is tighter (don't increase mid-run for stability)
+    # Only reduce chunk size if memory is tight
     if new_pts_chunk < current_pts_chunk:
         print(f"[Adaptive] Reduced pts_chunk to {new_pts_chunk:,} due to memory pressure")
         return new_pts_chunk
@@ -606,25 +599,3 @@ def mesh_to_sdf_torch(
 
     # Always return numpy arrays
     return SDFResult(phi.cpu().float().numpy(), origin.cpu().float().numpy(), dx_out, (nx, ny, nz))
-
-
-# # ------------------------------------------------------------------ quick demo
-# if __name__ == "__main__":
-#     import numpy as np, trimesh, time
-#     mesh = trimesh.creation.icosphere(subdivisions=4, radius=0.5)
-#     domain = dict(x=(-1,1), y=(-1,1), z=(-1,1))
-#     dx = 0.1
-
-#     t0 = time.time()
-#     res = mesh_to_sdf_torch(mesh.vertices, mesh.faces,
-#                             domain, dx,
-#                             pts_chunk=500_000,
-#                             tri_chunk=15_000,
-#                             use_accel=True, bin_factor=4,
-#                             accel_mode="auto",
-#                             dtype_mode="mixed",
-#                             device="cpu", compile_kernels=False)
-#     print("Done in", time.time()-t0, "s  |  phi min/max:", res.phi.min(), res.phi.max())
-
-
-    ##accel_mode:: "none" | "aabb" | "auto"

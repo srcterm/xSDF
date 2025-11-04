@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 plot_utils.py  —  Visualization utilities for SDF mesher.
 

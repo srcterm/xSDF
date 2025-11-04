@@ -39,16 +39,11 @@ def mesh_to_sdf_trimesh(mesh: trimesh.Trimesh,
 
     # Calculate chunk size from memory budget
     if memory_budget_gb is not None:
-        # Trimesh internally allocates MUCH more than output array
-        # Use very conservative factor (5%) to account for:
-        # - BVH tree construction
-        # - Distance matrix computations (N_points × N_triangles intermediate arrays)
         usable_bytes = int(memory_budget_gb * (1024**3) * 0.05)  # 5% of budget
         chunk_size = max(4, int((usable_bytes / 4) ** (1/3)))
-        # Cap at 28 for safety regardless of memory budget
         chunk_size = min(chunk_size, 28)
     else:
-        chunk_size = 32  # Conservative default
+        chunk_size = 28
 
     # Clamp to grid dimensions
     chunk_size = max(4, min(chunk_size, nx, ny, nz))
@@ -81,8 +76,7 @@ def mesh_to_sdf_trimesh(mesh: trimesh.Trimesh,
                 Xc, Yc, Zc = np.meshgrid(x_coords[i0:i1], y_coords[j0:j1], z_coords[k0:k1], indexing='ij')
                 pts = np.column_stack([Xc.ravel(), Yc.ravel(), Zc.ravel()])
 
-                # Process points in small sub-batches to work around trimesh memory leak
-                # Trimesh leaks memory with large point arrays, so use tiny batches
+                # Process points in small sub-batches 
                 point_batch_size = 2000  # Process 2000 points at a time
                 n_points = pts.shape[0]
                 d = np.zeros(n_points, dtype=np.float32)
@@ -90,16 +84,12 @@ def mesh_to_sdf_trimesh(mesh: trimesh.Trimesh,
                 for p0 in range(0, n_points, point_batch_size):
                     p1 = min(p0 + point_batch_size, n_points)
                     d[p0:p1] = trimesh.proximity.signed_distance(mesh, pts[p0:p1])
-                    # Clear cache after each sub-batch to prevent accumulation
                     mesh._cache.clear()
-
                 sdf_chunk = (-d).reshape(Xc.shape).astype(np.float32)
                 sdf[i0:i1, j0:j1, k0:k1] = sdf_chunk
 
-                # Explicit memory cleanup to prevent accumulation
+                # Clean up
                 del Xc, Yc, Zc, pts, d, sdf_chunk
-
-                # Force garbage collection every 2 chunks
                 if chunk_count % 2 == 0:
                     gc.collect()
 
