@@ -63,8 +63,12 @@ def create_cylinder_mesh(radius=1.0, height=2.0, scale=1.0,
 def load_stl_mesh(stl_path, scale=1.0, translate=(0.0, 0.0, 0.0), rotate=(0.0, 0.0, 0.0)):
     """Load and transform STL mesh with positioning control."""
     # mesh = trimesh.load_mesh(stl_path)
-    mesh = trimesh.load(stl_path, process=False)
-    
+    mesh = trimesh.load(stl_path, process=True)
+
+    # If trimesh returns a Scene (multiple bodies), concatenate into a single mesh
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.dump(concatenate=True)
+
     # Apply transformations
     mesh.apply_scale(scale)
     rotation_matrix = trimesh.transformations.euler_matrix(
@@ -75,13 +79,15 @@ def load_stl_mesh(stl_path, scale=1.0, translate=(0.0, 0.0, 0.0), rotate=(0.0, 0
     
     if not mesh.is_watertight:
         print("Warning: STL mesh is not watertight. Attempting to repair...")
-        mesh.fill_holes()
+        trimesh.repair.fix_normals(mesh)
+        trimesh.repair.fill_holes(mesh)
+        trimesh.repair.fix_inversion(mesh)
     
     print(f"Loaded STL: {len(mesh.faces)} faces, watertight: {mesh.is_watertight}")
     print(f"Bounds: {mesh.bounds}")
 
     if not mesh.is_watertight:
-        raise ValueError("Mesh is not watertight. Please provide a watertight STL/PLY file.")
+        print("WARNING: Mesh is still not watertight after repair. SDF sign may be unreliable.")
     
     # Ensure consistent winding for correct sign computation
     if not mesh.is_winding_consistent:
