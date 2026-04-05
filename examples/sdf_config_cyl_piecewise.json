@@ -1,0 +1,71 @@
+{
+  "description": "3D cylinder with piecewise grid stretching (coarse, for testing)",
+
+  "_comments": {
+    "piecewise": "CONSTANT=uniform, INCREASING=fine->coarse (CONSTANT left), DECREASING=coarse->fine (CONSTANT right)"
+  },
+
+  "output": {
+    "save_name": "cyl_piecewise_test.h5",
+    "visualize": true
+  },
+
+  "domain": {
+    "bounds": {
+      "x": [-5.0, 7.0],
+      "y": [-3.0, 3.0],
+      "z": [0.0, 6.0]
+    }
+  },
+
+  "geometry": {
+    "type": "cylinder",
+    "path": "",
+    "transformations": {
+      "scale": 0.05,
+      "translate": [0.0, 0.0, 1.8],
+      "rotate": [0.0, 0.0, 18.0]
+    }
+  },
+
+  "grid": {
+    "target_min_size": 0.015,
+    "stretch_factor": 1.075,
+    "stretch_axes": {
+      "x": {
+        "type": "piecewise",
+        "segments": [
+          {"type": "DECREASING", "lower_bound": -5.0, "upper_bound": -1.0},
+          {"type": "CONSTANT",   "lower_bound": -1.0, "upper_bound":  2.0},
+          {"type": "INCREASING", "lower_bound":  2.0, "upper_bound":  7.0}
+        ]
+      },
+      "y": {
+        "type": "piecewise",
+        "segments": [
+          {"type": "DECREASING", "lower_bound": -3.0, "upper_bound": -1.0},
+          {"type": "CONSTANT",   "lower_bound": -1.0, "upper_bound":  1.0},
+          {"type": "INCREASING", "lower_bound":  1.0, "upper_bound":  3.0}
+        ]
+      },
+      "z": {
+        "type": "piecewise",
+        "segments": [
+          {"type": "CONSTANT",   "lower_bound": 0.0, "upper_bound": 3.0},
+          {"type": "INCREASING", "lower_bound": 3.0, "upper_bound": 6.0}
+        ]
+      }
+    },
+    "preview_stretch": true
+  },
+
+  "backend": {
+    "method": "torch",
+    "memory_budget_gb": 8.0,
+    "torch": {
+      "device": "mps",
+      "use_accel": true,
+      "compile_kernels": false
+    }
+  }
+}

@@ -113,6 +113,10 @@ def load_config(config_path: str) -> dict:
     for axis in ['x', 'y', 'z']:
         if axis in config['grid']['stretch_axes']:
             ax_cfg = config['grid']['stretch_axes'][axis]
+            if ax_cfg.get('type') == 'piecewise':
+                ax_cfg.setdefault('dx_target', target_min_size)
+                ax_cfg.setdefault('r_target', stretch_factor)
+                continue
             # Inherit dx_min from target_min_size if null
             if ax_cfg.get('dx_min') is None:
                 ax_cfg['dx_min'] = target_min_size
@@ -188,6 +192,10 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
         """
         cfg = stretch_axes.get(ax_name, {})
         a, b = domain_bounds[ax_name]
+
+        if cfg.get("type") == "piecewise":
+            return stretch_helper.piecewise_coords(
+                cfg["segments"], cfg["dx_target"], cfg["r_target"])
 
         # Extract parameters with sensible defaults
         center = cfg.get("center", 0.5 * (a + b))  # default to domain center
