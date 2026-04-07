@@ -211,14 +211,18 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
     z_coords = _build_axis('z')
 
     # ---------------- Calculate grid size and spacing ----------------
+    # Face-centric convention: coord arrays are cell-face positions (length n_cells+1).
     gx, gy, gz = len(x_coords), len(y_coords), len(z_coords)
     total_pts = gx * gy * gz
+    nx_cells, ny_cells, nz_cells = gx - 1, gy - 1, gz - 1
+    total_cells = nx_cells * ny_cells * nz_cells
 
     # Calculate spacing info for display
     dx_min = min(np.diff(x_coords).min(), np.diff(y_coords).min(), np.diff(z_coords).min())
     dx_max = max(np.diff(x_coords).max(), np.diff(y_coords).max(), np.diff(z_coords).max())
 
-    print(f"\n[Grid Size] {gx}x{gy}x{gz} = {total_pts:,} voxels")
+    print(f"\n[Grid Size] {nx_cells}x{ny_cells}x{nz_cells} = {total_cells:,} cells "
+          f"({gx}x{gy}x{gz} = {total_pts:,} face-vertex sample points)")
     print(f"[Spacing] Δmin={dx_min:.6g}, Δmax={dx_max:.6g}, ratio={dx_max/dx_min:.2f}x")
 
     # ------ Preview grid if requested ------
