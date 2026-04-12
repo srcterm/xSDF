@@ -13,7 +13,7 @@
 
   "domain": {
     "bounds": {
-      "x": [-2.0, 3.0],
+      "x": [-2.0, 2.5],
       "y": [-1.0, 1.0],
       "z": [0.0, 1.0]
     }
@@ -36,9 +36,9 @@
       "x": {
         "type": "piecewise",
         "segments": [
-          {"type": "DECREASING", "lower_bound": -2.0,  "upper_bound": -1.35},
-          {"type": "CONSTANT",   "lower_bound": -1.35,  "upper_bound":  0.75},
-          {"type": "INCREASING", "lower_bound":  0.75,  "upper_bound":  3.0}
+          {"type": "DECREASING", "lower_bound": -2.0,  "upper_bound": -1.25},
+          {"type": "CONSTANT",   "lower_bound": -1.25,  "upper_bound":  0.5},
+          {"type": "INCREASING", "lower_bound":  0.5,  "upper_bound":  2.5}
         ]
       },
       "y": {

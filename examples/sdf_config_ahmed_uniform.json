@@ -9,21 +9,21 @@
   },
 
   "output": {
-    "save_name": "drivAer_run_1_test.h5",
+    "save_name": "AHMED_UNIFORM_CS005.h5",
     "visualize": true
   },
 
   "domain": {
     "bounds": {
-      "x": [-2.5, 2.5],
-      "y": [-1.25, 1.25],
+      "x": [-2.0, 2.5],
+      "y": [-1.0, 1.0],
       "z": [0.0, 1.0]
     }
   },
 
   "geometry": {
     "type": "stl",
-    "path": "/Users/ianhubbard/Documents/ahmed_1.stl",
+    "path": "examples/ahmed_1.stl",
     "transformations": {
       "scale": 1.0,
       "translate": [0.0, 0.0, 0.0],
@@ -32,13 +32,13 @@
   },
 
   "grid": {
-    "target_min_size": 0.015,
-    "stretch_factor": 1.075,
+    "target_min_size": 0.05,
+    "stretch_factor": 1.0,
     "stretch_axes": {
       "x": {
-        "center": -0.50,
+        "center": 0.0,
         "dx_min": null,
-        "r_max": 1.025
+        "r_max": null
       },
       "y": {
         "center": 0.0,
@@ -46,7 +46,7 @@
         "r_max": null
       },
       "z": {
-        "center": 0.15,
+        "center": 0.0,
         "dx_min": null,
         "r_max": null
       }
