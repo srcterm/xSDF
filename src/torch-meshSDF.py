@@ -469,8 +469,8 @@ def mesh_to_sdf_torch(
     Args:
         V_np: Vertex array (N, 3) - mesh vertices
         F_np: Face array (T, 3) - triangle face indices
-        x_coords, y_coords, z_coords: 1D coordinate arrays defining the grid (uniform or non-uniform).
-                                     These should represent cell centers where SDF is sampled.
+        x_coords, y_coords, z_coords: 1D coordinate arrays defining the sample points at which
+                                     the SDF is evaluated (uniform or non-uniform).
         device: 'cuda'/'mps'/'cpu'/None (auto-select: cuda > mps > cpu)
         compile_kernels: Use torch.compile for 2-3x speedup (default True)
         use_accel: Enable AABB spatial acceleration (default True). False uses brute force.

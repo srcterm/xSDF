@@ -1,0 +1,72 @@
+{
+  "description": "Ahmed body 25deg with piecewise grid stretching (coarse, for testing)",
+
+  "_comments": {
+    "ahmed_bounds": "x: [-1.19, 0.0], y: [-0.18, 0.18], z: [0.05, 0.30]",
+    "piecewise": "CONSTANT=uniform, INCREASING=fine->coarse (CONSTANT left), DECREASING=coarse->fine (CONSTANT right)"
+  },
+
+  "output": {
+    "save_name": "AHMED_PWGrid_CS002-STRCH105.h5",
+    "visualize": true
+  },
+
+  "domain": {
+    "bounds": {
+      "x": [-2.0, 2.5],
+      "y": [-1.0, 1.0],
+      "z": [0.0, 1.0]
+    }
+  },
+
+  "geometry": {
+    "type": "stl",
+    "path": "examples/ahmed_1.stl",
+    "transformations": {
+      "scale": 1.0,
+      "translate": [0.0, 0.0, 0.0],
+      "rotate": [0.0, 0.0, 0.0]
+    }
+  },
+
+  "grid": {
+    "target_min_size": 0.02,
+    "stretch_factor": 1.05,
+    "stretch_axes": {
+      "x": {
+        "type": "piecewise",
+        "segments": [
+          {"type": "DECREASING", "lower_bound": -2.0,  "upper_bound": -1.25},
+          {"type": "CONSTANT",   "lower_bound": -1.25,  "upper_bound":  0.5},
+          {"type": "INCREASING", "lower_bound":  0.5,  "upper_bound":  2.5}
+        ]
+      },
+      "y": {
+        "type": "piecewise",
+        "segments": [
+          {"type": "DECREASING", "lower_bound": -1.0, "upper_bound": -0.3},
+          {"type": "CONSTANT",   "lower_bound": -0.3, "upper_bound":  0.3},
+          {"type": "INCREASING", "lower_bound":  0.3, "upper_bound":  1.0}
+        ]
+      },
+      "z": {
+        "type": "piecewise",
+        "segments": [
+          {"type": "CONSTANT",   "lower_bound": 0.0, "upper_bound": 0.35},
+          {"type": "INCREASING", "lower_bound": 0.35, "upper_bound": 1.0}
+        ]
+      }
+    },
+    "preview_stretch": true
+  },
+
+  "backend": {
+    "method": "torch",
+    "memory_budget_gb": 8.0,
+    "torch": {
+      "device": "mps",
+      "use_accel": true,
+      "compile_kernels": false
+    }
+  }
+}

@@ -24,37 +24,37 @@ def preview_grid_coords(x_coords: np.ndarray, y_coords: np.ndarray, z_coords: np
     
     # ------ XY plane ------
     Xp, Yp = np.meshgrid(x_coords, y_coords, indexing='ij')
-    axes[0].scatter(Xp.ravel(), Yp.ravel(), s=2, label='Grid centres')
+    axes[0].scatter(Xp.ravel(), Yp.ravel(), s=2, label='Grid faces')
     if mesh is not None:
         verts = mesh.vertices
         axes[0].scatter(verts[:, 0], verts[:, 1], s=1, alpha=0.3, color='gray', label='Geometry verts')
     axes[0].set_xlabel('x')
     axes[0].set_ylabel('y')
-    axes[0].set_title('XY grid centres')
+    axes[0].set_title('XY grid faces')
     axes[0].axis('equal')
     # axes[0].legend()
 
     # ------ YZ plane ------
     Yp2, Zp = np.meshgrid(y_coords, z_coords, indexing='ij')
-    axes[1].scatter(Yp2.ravel(), Zp.ravel(), s=2, label='Grid centres')
+    axes[1].scatter(Yp2.ravel(), Zp.ravel(), s=2, label='Grid faces')
     if mesh is not None:
         verts = mesh.vertices
         axes[1].scatter(verts[:, 1], verts[:, 2], s=1, alpha=0.3, color='gray', label='Geometry verts')
     axes[1].set_xlabel('y')
     axes[1].set_ylabel('z')
-    axes[1].set_title('YZ grid centres')
+    axes[1].set_title('YZ grid faces')
     axes[1].axis('equal')
     # axes[1].legend()
 
     # ------ XZ plane ------
     Xp2, Zp2 = np.meshgrid(x_coords, z_coords, indexing='ij')
-    axes[2].scatter(Xp2.ravel(), Zp2.ravel(), s=2, label='Grid centres')
+    axes[2].scatter(Xp2.ravel(), Zp2.ravel(), s=2, label='Grid faces')
     if mesh is not None:
         verts = mesh.vertices
         axes[2].scatter(verts[:, 0], verts[:, 2], s=1, alpha=0.3, color='gray', label='Geometry verts')
     axes[2].set_xlabel('x')
     axes[2].set_ylabel('z')
-    axes[2].set_title('XZ grid centres')
+    axes[2].set_title('XZ grid faces')
     axes[2].axis('equal')
     # axes[2].legend()
     plt.tight_layout()

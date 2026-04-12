@@ -63,8 +63,12 @@ def create_cylinder_mesh(radius=1.0, height=2.0, scale=1.0,
 def load_stl_mesh(stl_path, scale=1.0, translate=(0.0, 0.0, 0.0), rotate=(0.0, 0.0, 0.0)):
     """Load and transform STL mesh with positioning control."""
     # mesh = trimesh.load_mesh(stl_path)
-    mesh = trimesh.load(stl_path, process=False)
-    
+    mesh = trimesh.load(stl_path, process=True)
+
+    # If trimesh returns a Scene (multiple bodies), concatenate into a single mesh
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.dump(concatenate=True)
+
     # Apply transformations
     mesh.apply_scale(scale)
     rotation_matrix = trimesh.transformations.euler_matrix(
@@ -75,13 +79,15 @@ def load_stl_mesh(stl_path, scale=1.0, translate=(0.0, 0.0, 0.0), rotate=(0.0, 0
     
     if not mesh.is_watertight:
         print("Warning: STL mesh is not watertight. Attempting to repair...")
-        mesh.fill_holes()
+        trimesh.repair.fix_normals(mesh)
+        trimesh.repair.fill_holes(mesh)
+        trimesh.repair.fix_inversion(mesh)
     
     print(f"Loaded STL: {len(mesh.faces)} faces, watertight: {mesh.is_watertight}")
     print(f"Bounds: {mesh.bounds}")
 
     if not mesh.is_watertight:
-        raise ValueError("Mesh is not watertight. Please provide a watertight STL/PLY file.")
+        print("WARNING: Mesh is still not watertight after repair. SDF sign may be unreliable.")
     
     # Ensure consistent winding for correct sign computation
     if not mesh.is_winding_consistent:
@@ -107,6 +113,10 @@ def load_config(config_path: str) -> dict:
     for axis in ['x', 'y', 'z']:
         if axis in config['grid']['stretch_axes']:
             ax_cfg = config['grid']['stretch_axes'][axis]
+            if ax_cfg.get('type') == 'piecewise':
+                ax_cfg.setdefault('dx_target', target_min_size)
+                ax_cfg.setdefault('r_target', stretch_factor)
+                continue
             # Inherit dx_min from target_min_size if null
             if ax_cfg.get('dx_min') is None:
                 ax_cfg['dx_min'] = target_min_size
@@ -183,6 +193,10 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
         cfg = stretch_axes.get(ax_name, {})
         a, b = domain_bounds[ax_name]
 
+        if cfg.get("type") == "piecewise":
+            return stretch_helper.piecewise_coords(
+                cfg["segments"], cfg["dx_target"], cfg["r_target"])
+
         # Extract parameters with sensible defaults
         center = cfg.get("center", 0.5 * (a + b))  # default to domain center
         dx_min = cfg.get("dx_min", target_voxel_size)  # default to target size
@@ -197,14 +211,18 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
     z_coords = _build_axis('z')
 
     # ---------------- Calculate grid size and spacing ----------------
+    # Face-centric convention: coord arrays are cell-face positions (length n_cells+1).
     gx, gy, gz = len(x_coords), len(y_coords), len(z_coords)
     total_pts = gx * gy * gz
+    nx_cells, ny_cells, nz_cells = gx - 1, gy - 1, gz - 1
+    total_cells = nx_cells * ny_cells * nz_cells
 
     # Calculate spacing info for display
     dx_min = min(np.diff(x_coords).min(), np.diff(y_coords).min(), np.diff(z_coords).min())
     dx_max = max(np.diff(x_coords).max(), np.diff(y_coords).max(), np.diff(z_coords).max())
 
-    print(f"\n[Grid Size] {gx}x{gy}x{gz} = {total_pts:,} voxels")
+    print(f"\n[Grid Size] {nx_cells}x{ny_cells}x{nz_cells} = {total_cells:,} cells "
+          f"({gx}x{gy}x{gz} = {total_pts:,} face-vertex sample points)")
     print(f"[Spacing] Δmin={dx_min:.6g}, Δmax={dx_max:.6g}, ratio={dx_max/dx_min:.2f}x")
 
     # ------ Preview grid if requested ------

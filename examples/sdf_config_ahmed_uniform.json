@@ -1,0 +1,66 @@
+{
+  "description": "xSDF configuration file",
+
+  "_comments": {
+    "geometry_type": "Options: 'cube', 'cylinder', 'stl'",
+    "backend_method": "Options: 'torch' (GPU), 'trimesh' (CPU)",
+    "grid_stretch": "Set r_max=1.0 for uniform spacing, >1.0 for stretching",
+    "grid_null_values": "null values in stretch_axes inherit from target_min_size and stretch_factor"
+  },
+
+  "output": {
+    "save_name": "AHMED_UNIFORM_CS005.h5",
+    "visualize": true
+  },
+
+  "domain": {
+    "bounds": {
+      "x": [-2.0, 2.5],
+      "y": [-1.0, 1.0],
+      "z": [0.0, 1.0]
+    }
+  },
+
+  "geometry": {
+    "type": "stl",
+    "path": "examples/ahmed_1.stl",
+    "transformations": {
+      "scale": 1.0,
+      "translate": [0.0, 0.0, 0.0],
+      "rotate": [0.0, 0.0, 0.0]
+    }
+  },
+
+  "grid": {
+    "target_min_size": 0.05,
+    "stretch_factor": 1.0,
+    "stretch_axes": {
+      "x": {
+        "center": 0.0,
+        "dx_min": null,
+        "r_max": null
+      },
+      "y": {
+        "center": 0.0,
+        "dx_min": null,
+        "r_max": null
+      },
+      "z": {
+        "center": 0.0,
+        "dx_min": null,
+        "r_max": null
+      }
+    },
+    "preview_stretch": true
+  },
+
+  "backend": {
+    "method": "torch",
+    "memory_budget_gb": 8.0,
+    "torch": {
+      "device": "mps",
+      "use_accel": true,
+      "compile_kernels": false
+    }
+  }
+}
