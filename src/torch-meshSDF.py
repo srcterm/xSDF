@@ -1,9 +1,23 @@
 # Set MPS fallback policy before importing torch
 import os
+import importlib.util
+import time
 import numpy as np
 import math, torch
 from dataclasses import dataclass
 from typing import Tuple, Optional
+
+# Load sibling BVH module by file path (matches xSDF.py's loader pattern; works
+# whether this file is imported as `torch_meshSDF` via importlib or as a script).
+_BVH_FILE = os.path.join(os.path.dirname(__file__), "bvh.py")
+_bvh_spec = importlib.util.spec_from_file_location("xsdf_bvh", _BVH_FILE)
+_bvh_mod = importlib.util.module_from_spec(_bvh_spec)
+_bvh_spec.loader.exec_module(_bvh_mod)
+
+_FF_FILE = os.path.join(os.path.dirname(__file__), "floodfill.py")
+_ff_spec = importlib.util.spec_from_file_location("xsdf_floodfill", _FF_FILE)
+_ff_mod = importlib.util.module_from_spec(_ff_spec)
+_ff_spec.loader.exec_module(_ff_mod)
 
 # ------------------------------------------------------------------ utilities
 def pick_device(prefer: Optional[str] = None) -> torch.device:
@@ -367,6 +381,27 @@ def _select_triangles_for_batch(
     return tri_ids
 
 
+def _compute_solid_angle_only(
+    P: torch.Tensor,
+    tri_ids: torch.Tensor,
+    V: torch.Tensor,
+    F: torch.Tensor,
+    tri_chunk: int,
+) -> torch.Tensor:
+    """Solid-angle accumulation only — no distance computation."""
+    device = P.device
+    omega_tot = torch.zeros((P.shape[0],), device=device, dtype=torch.float32)
+    for t0 in range(0, tri_ids.shape[0], tri_chunk):
+        tid = tri_ids[t0:t0+tri_chunk]
+        A = V[F[tid, 0]]
+        B = V[F[tid, 1]]
+        C = V[F[tid, 2]]
+        w_batch = solid_angle_sign_torch(P, A, B, C)
+        w_batch = torch.nan_to_num(w_batch, nan=0.0, posinf=0.0, neginf=0.0)
+        omega_tot += w_batch
+    return omega_tot
+
+
 def _compute_batch_distances(
     P: torch.Tensor,
     tri_ids: torch.Tensor,
@@ -447,6 +482,120 @@ def _apply_sign_to_distances(
     return signed
 
 
+# ------------------------------------------------------------------ FWN pipeline
+
+def _run_fwn_pipeline(
+    V: torch.Tensor,
+    F: torch.Tensor,
+    x_coords_t: torch.Tensor,
+    y_coords_t: torch.Tensor,
+    z_coords_t: torch.Tensor,
+    dev: torch.device,
+    max_reasonable_dist: float,
+    beta: float,
+    band_width_cells: float,
+    bvh_leaf_size: int,
+    bvh_build_device: str,
+) -> torch.Tensor:
+    """All-GPU SDF via skip-pointer BVH + Barill FWN + flood-fill + fast sweep.
+
+    Pipeline:
+        1. Build BVH (CPU), upload skip-pointer + dipole fields to device.
+        2. Band classify grid points: bvh_min_distance_gpu with d_best pinned
+           to band_threshold. Cells under the threshold are "band" cells.
+        3. In-band: exact FWN (sign) + bvh_min_distance_gpu (|d|).
+        4. Flood-fill sign from a corner seed through non-band cells.
+        5. Fast sweep propagates |d| out of the band.
+        6. Assemble phi = sign * |d|, pin band cells to their exact values.
+    """
+    t0 = time.time()
+    bvh_built = _bvh_mod.build_bvh_torch(V, F, leaf_size=bvh_leaf_size,
+                                          build_device=bvh_build_device)
+    bvh = _bvh_mod.bvh_to_device(bvh_built, dev)
+    stats = _bvh_mod.bvh_stats(bvh)
+    print(f"[FWN] BVH: {stats['n_nodes']} nodes, depth={stats['max_depth']}, "
+          f"leaves={stats['n_leaves']}, avg_leaf={stats['avg_leaf_size']:.1f}, "
+          f"max_leaf={stats['max_leaf_size']} | build={(time.time()-t0)*1000:.1f}ms")
+
+    Nx = int(x_coords_t.numel())
+    Ny = int(y_coords_t.numel())
+    Nz = int(z_coords_t.numel())
+    # Build grid points in (Nx, Ny, Nz, 3) ij order.
+    Xg, Yg, Zg = torch.meshgrid(x_coords_t, y_coords_t, z_coords_t, indexing="ij")
+    P = torch.stack([Xg, Yg, Zg], dim=-1).reshape(-1, 3).to(dev)
+
+    # Grid spacing (non-uniform safe: use max local spacing).
+    def _max_h(coord):
+        if coord.numel() < 2:
+            return 0.0
+        d = (coord[1:] - coord[:-1]).abs()
+        return float(d.max())
+    dx = _max_h(x_coords_t)
+    dy = _max_h(y_coords_t)
+    dz = _max_h(z_coords_t)
+    h = max(dx, dy, dz)
+    band_threshold = float(band_width_cells) * h
+
+    # Band classification.
+    t1 = time.time()
+    band_mask_flat, d_upper = _ff_mod.classify_band(
+        P, bvh, V, F, band_threshold, _bvh_mod
+    )
+    n_band = int(band_mask_flat.sum())
+    total = int(band_mask_flat.numel())
+    print(f"[FWN] band: {n_band}/{total}  ({100.0*n_band/max(total,1):.1f}%)  "
+          f"threshold={band_threshold:.4g}  ({time.time()-t1:.2f}s)")
+
+    band_idx = band_mask_flat.nonzero().flatten()
+    band_mask_3d = band_mask_flat.view(Nx, Ny, Nz)
+
+    # Exact sign and |d| in band.
+    sign_band = torch.zeros((n_band,), dtype=torch.float32, device=dev)
+    d_band = torch.zeros((n_band,), dtype=torch.float32, device=dev)
+    if n_band > 0:
+        P_band = P[band_idx]
+        t2 = time.time()
+        w_band = _bvh_mod.fwn_query(P_band, bvh, V, F, beta=beta)
+        # Convention matches _apply_sign_to_distances: inside is negative.
+        # CCW outward normals ⇒ w≈+1 inside, ≈0 outside.
+        sign_band = torch.where(w_band > 0.5, -1.0, 1.0).to(torch.float32)
+        print(f"[FWN] fwn_query: {(time.time()-t2)*1000:.1f}ms")
+
+        t3 = time.time()
+        d_band = _bvh_mod.bvh_min_distance_gpu(
+            P_band, bvh, V, F,
+            max_reasonable_dist=float(max_reasonable_dist),
+            initial_upper=d_upper[band_idx],
+        )
+        print(f"[FWN] bvh_min_distance_gpu: {(time.time()-t3)*1000:.1f}ms")
+
+    # Flood-fill sign from a corner (assumed outside after padding).
+    t4 = time.time()
+    sign_outside_3d = _ff_mod.flood_fill_sign_gpu(band_mask_3d, seed=(0, 0, 0))
+    print(f"[FWN] flood_fill: {(time.time()-t4)*1000:.1f}ms")
+
+    # Fast sweep to propagate |d| from band to the full grid.
+    phi_band_abs_3d = torch.zeros((Nx, Ny, Nz), dtype=torch.float32, device=dev)
+    if n_band > 0:
+        phi_band_abs_3d.view(-1)[band_idx] = d_band
+
+    t5 = time.time()
+    u = _ff_mod.fast_sweep_gpu(
+        phi_band_abs_3d, band_mask_3d,
+        x_coords_t.to(dev), y_coords_t.to(dev), z_coords_t.to(dev),
+    )
+    print(f"[FWN] fast_sweep: {(time.time()-t5)*1000:.1f}ms")
+
+    # Assemble phi:
+    #   - band cells: sign_band * d_band
+    #   - non-band:   sign_outside * u
+    phi_flat = (sign_outside_3d * u).view(-1)
+    if n_band > 0:
+        phi_flat[band_idx] = sign_band * d_band
+
+    return phi_flat.view(Nx, Ny, Nz)
+
+
 # ------------------------------------------------------------------ main driver
 def mesh_to_sdf_torch(
     V_np, F_np,
@@ -457,7 +606,12 @@ def mesh_to_sdf_torch(
     device=None,
     compile_kernels=True,
     use_accel=True,
+    accel: Optional[str] = None,
+    bvh_leaf_size: int = 8,
+    bvh_build_device: str = "cpu",
     target_memory_gb: Optional[float] = None,
+    fwn_beta: float = 2.0,
+    fwn_band_width_cells: float = 2.0,
 ):
     """
     Compute signed distance field (SDF) using PyTorch with automatic chunking and AABB acceleration.
@@ -474,7 +628,24 @@ def mesh_to_sdf_torch(
         device: 'cuda'/'mps'/'cpu'/None (auto-select: cuda > mps > cpu)
         compile_kernels: Use torch.compile for 2-3x speedup (default True)
         use_accel: Enable AABB spatial acceleration (default True). False uses brute force.
+            Ignored if `accel` is explicitly passed.
+        accel: Optional acceleration mode — one of 'none', 'aabb', 'bvh', 'fwn'.
+            When None, falls back to the legacy boolean `use_accel` ('aabb' if
+            True else 'none'). 'bvh' runs a hybrid: per-point branch-and-bound
+            distance query on CPU and solid-angle on the SDF device via the
+            flat AABB prune. 'fwn' runs an all-GPU pipeline: skip-pointer BVH
+            traversal with Barill fast winding number for sign and exact |d|
+            in a narrow band, plus flood-fill sign extension and fast-sweep
+            eikonal propagation for the far field.
+        bvh_leaf_size: max triangles per BVH leaf (used by 'bvh' and 'fwn').
+        bvh_build_device: device for the BVH build ('cpu' recommended — build is
+            inherently sequential and per-node kernel launch overhead dominates GPU).
         target_memory_gb: Manual memory budget for auto-chunking (auto-detected if None)
+        fwn_beta: Barill β-admissibility threshold (only used when accel='fwn').
+            β=2.0 gives ~4-digit sign accuracy. Raise to 3.0 for tighter trees.
+        fwn_band_width_cells: Narrow-band half-width in grid cells (accel='fwn').
+            Cells within `band_width * max(dx,dy,dz)` of the mesh get exact
+            FWN sign + exact |d|; the rest get flood-fill sign + FSM |d|.
 
     Sign Method:
         Uses solid_angle (winding number) for robust inside/outside determination:
@@ -527,8 +698,41 @@ def mesh_to_sdf_torch(
     phi = torch.empty(total_pts, dtype=torch.float32, device=dev)
 
     # ============ Acceleration mode ============
-    mode = "aabb" if use_accel else "none"
-    print(f"[Accel] {'AABB pruning enabled' if use_accel else 'No acceleration (brute force)'}")
+    if accel is None:
+        mode = "aabb" if use_accel else "none"
+    else:
+        mode = accel.lower()
+        if mode not in ("none", "aabb", "bvh", "fwn"):
+            raise ValueError(f"Unknown accel mode '{accel}'. Use 'none', 'aabb', 'bvh', or 'fwn'.")
+
+    bvh_cpu = None
+    V_cpu = None
+    F_cpu = None
+    if mode == "fwn":
+        phi_3d = _run_fwn_pipeline(
+            V, F, x_coords_t, y_coords_t, z_coords_t, dev,
+            max_reasonable_dist=max_reasonable_dist,
+            beta=fwn_beta,
+            band_width_cells=fwn_band_width_cells,
+            bvh_leaf_size=bvh_leaf_size,
+            bvh_build_device=bvh_build_device,
+        )
+        phi = phi_3d.reshape(-1)
+    elif mode == "bvh":
+        t_build0 = time.time()
+        bvh_built = _bvh_mod.build_bvh_torch(V, F, leaf_size=bvh_leaf_size,
+                                              build_device="cpu")
+        t_build = time.time() - t_build0
+        bvh_cpu = bvh_built  # already on CPU
+        V_cpu = V.detach().to("cpu")
+        F_cpu = F.detach().to("cpu")
+        stats = _bvh_mod.bvh_stats(bvh_cpu)
+        print(f"[Accel] BVH (hybrid CPU-distance / GPU-sign): {stats['n_nodes']} nodes, "
+              f"depth={stats['max_depth']}, {stats['n_leaves']} leaves, "
+              f"avg_leaf={stats['avg_leaf_size']:.1f}, max_leaf={stats['max_leaf_size']} | "
+              f"build={t_build*1000:.1f}ms on cpu")
+    else:
+        print(f"[Accel] {'AABB pruning enabled' if mode == 'aabb' else 'No acceleration (brute force)'}")
 
     # ============ Optional torch.compile ============
     global point_triangle_distance_torch, solid_angle_sign_torch
@@ -541,7 +745,7 @@ def mesh_to_sdf_torch(
     batch_num = 0
 
     with torch.no_grad():
-        while processed < total_pts:
+        while mode != "fwn" and processed < total_pts:
             # Dynamic chunking: adapt to memory pressure
             pts_chunk = dynamic_chunking(batch_num, pts_chunk, total_pts, processed, Ntris, dev, target_memory_gb)
             batch_num += 1
@@ -555,14 +759,28 @@ def mesh_to_sdf_torch(
             Pz = z_coords_t.index_select(0, idx_batch[:, 2])
             P = torch.stack([Px, Py, Pz], dim=1).to(dev)
 
-            # Select triangles for this batch
-            tri_ids = _select_triangles_for_batch(P, mesh_data, mode, domain_extents, dev, Ntris)
-            tri_count_for_batch = tri_ids.numel()
-
-            # Compute distances and solid angles
-            min_d, omega_tot = _compute_batch_distances(
-                P, tri_ids, V, F, tri_chunk, max_reasonable_dist
-            )
+            # Select triangles and run distance/solid-angle kernels.
+            if mode == "bvh":
+                # Hybrid: per-point BVH branch-and-bound on CPU for distance,
+                # flat AABB prune + solid-angle on GPU for sign. Each point's
+                # CPU descent prunes aggressively so far points stop fast;
+                # solid-angle stays where the math is big and parallel.
+                P_cpu = P.detach().to("cpu")
+                min_d_cpu = _bvh_mod.bvh_query_distances(
+                    P_cpu, bvh_cpu, V_cpu, F_cpu, max_reasonable_dist
+                )
+                min_d = min_d_cpu.to(dev)
+                min_d = torch.nan_to_num(min_d, nan=max_reasonable_dist,
+                                         posinf=max_reasonable_dist, neginf=max_reasonable_dist)
+                sign_tri_ids = _select_triangles_for_batch(P, mesh_data, "aabb", domain_extents, dev, Ntris)
+                tri_count_for_batch = sign_tri_ids.numel()
+                omega_tot = _compute_solid_angle_only(P, sign_tri_ids, V, F, tri_chunk)
+            else:
+                tri_ids = _select_triangles_for_batch(P, mesh_data, mode, domain_extents, dev, Ntris)
+                tri_count_for_batch = tri_ids.numel()
+                min_d, omega_tot = _compute_batch_distances(
+                    P, tri_ids, V, F, tri_chunk, max_reasonable_dist
+                )
 
             # Apply sign to distances
             signed = _apply_sign_to_distances(min_d, omega_tot)

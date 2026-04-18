@@ -134,6 +134,11 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
           # Torch SDF options (fp32 only)
           torch_device='mps',
           torch_use_accel=True,
+          torch_accel: Optional[str] = None,
+          bvh_leaf_size: int = 8,
+          bvh_build_device: str = 'cpu',
+          fwn_beta: float = 2.0,
+          fwn_band_width_cells: float = 2.0,
           compile_kernels=False,
           # Grid coordinate options (non-uniform by default, set r_max=1.0 for uniform)
           stretch_axes: Optional[Dict[str, Dict]] = None,
@@ -254,7 +259,12 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
             device=torch_device,
             compile_kernels=compile_kernels,
             use_accel=torch_use_accel,
+            accel=torch_accel,
+            bvh_leaf_size=bvh_leaf_size,
+            bvh_build_device=bvh_build_device,
             target_memory_gb=memory_budget_gb,
+            fwn_beta=fwn_beta,
+            fwn_band_width_cells=fwn_band_width_cells,
         )
         sdf = res.phi
         origin = res.origin
@@ -317,6 +327,7 @@ if __name__ == "__main__":
     t0 = time.time()
 
     # Run SDF computation
+    torch_cfg = cfg['backend'].get('torch', {})
     sdf = main(
         domain_bounds=cfg['domain']['bounds'],
         save_name=cfg['output']['save_name'],
@@ -329,9 +340,14 @@ if __name__ == "__main__":
         preview_stretch=cfg['grid']['preview_stretch'],
         method=cfg['backend']['method'],
         memory_budget_gb=cfg['backend']['memory_budget_gb'],
-        torch_device=cfg['backend']['torch']['device'],
-        torch_use_accel=cfg['backend']['torch']['use_accel'],
-        compile_kernels=cfg['backend']['torch']['compile_kernels']
+        torch_device=torch_cfg.get('device', 'mps'),
+        torch_use_accel=torch_cfg.get('use_accel', True),
+        torch_accel=torch_cfg.get('accel'),
+        bvh_leaf_size=torch_cfg.get('bvh_leaf_size', 8),
+        bvh_build_device=torch_cfg.get('bvh_build_device', 'cpu'),
+        fwn_beta=torch_cfg.get('fwn_beta', 2.0),
+        fwn_band_width_cells=torch_cfg.get('fwn_band_width_cells', 2.0),
+        compile_kernels=torch_cfg.get('compile_kernels', False),
     )
 
     print(f"Done in {(time.time()-t0)/60:.2f} min ({(time.time()-t0):.2f} sec)")

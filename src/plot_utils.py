@@ -15,48 +15,58 @@ import pyvista as pv
 
 
 def preview_grid_coords(x_coords: np.ndarray, y_coords: np.ndarray, z_coords: np.ndarray, mesh=None) -> bool:
-    """Scatter plots of XY and YZ centres for a stretched grid.
+    """Line-plots of cell faces for a stretched grid.
 
-    If *mesh* (trimesh.Trimesh) is provided, overlay its vertex projection for context.
-    Returns True if user wants to proceed, False to stop.
+    Each face is drawn as a single thin line (axvline/axhline) so that local cell
+    spacing is visually unambiguous, regardless of marker size or panel aspect
+    ratio. If *mesh* (trimesh.Trimesh) is provided, overlay its vertex projection
+    for context. Returns True if user wants to proceed, False to stop.
     """
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    
+    line_kw = dict(color='C0', linewidth=0.4, alpha=0.8)
+
+    def _draw_grid(ax, h_coords, v_coords, h_range, v_range):
+        for xv in h_coords:
+            ax.plot([xv, xv], v_range, **line_kw)
+        for yv in v_coords:
+            ax.plot(h_range, [yv, yv], **line_kw)
+        ax.set_xlim(h_range)
+        ax.set_ylim(v_range)
+
+    x_range = (float(x_coords[0]), float(x_coords[-1]))
+    y_range = (float(y_coords[0]), float(y_coords[-1]))
+    z_range = (float(z_coords[0]), float(z_coords[-1]))
+
     # ------ XY plane ------
-    Xp, Yp = np.meshgrid(x_coords, y_coords, indexing='ij')
-    axes[0].scatter(Xp.ravel(), Yp.ravel(), s=2, label='Grid faces')
+    _draw_grid(axes[0], x_coords, y_coords, x_range, y_range)
     if mesh is not None:
         verts = mesh.vertices
         axes[0].scatter(verts[:, 0], verts[:, 1], s=1, alpha=0.3, color='gray', label='Geometry verts')
     axes[0].set_xlabel('x')
     axes[0].set_ylabel('y')
-    axes[0].set_title('XY grid faces')
-    axes[0].axis('equal')
-    # axes[0].legend()
+    axes[0].set_title(f'XY grid faces ({len(x_coords)}×{len(y_coords)})')
+    axes[0].set_aspect('equal', adjustable='box')
 
     # ------ YZ plane ------
-    Yp2, Zp = np.meshgrid(y_coords, z_coords, indexing='ij')
-    axes[1].scatter(Yp2.ravel(), Zp.ravel(), s=2, label='Grid faces')
+    _draw_grid(axes[1], y_coords, z_coords, y_range, z_range)
     if mesh is not None:
         verts = mesh.vertices
         axes[1].scatter(verts[:, 1], verts[:, 2], s=1, alpha=0.3, color='gray', label='Geometry verts')
     axes[1].set_xlabel('y')
     axes[1].set_ylabel('z')
-    axes[1].set_title('YZ grid faces')
-    axes[1].axis('equal')
-    # axes[1].legend()
+    axes[1].set_title(f'YZ grid faces ({len(y_coords)}×{len(z_coords)})')
+    axes[1].set_aspect('equal', adjustable='box')
 
     # ------ XZ plane ------
-    Xp2, Zp2 = np.meshgrid(x_coords, z_coords, indexing='ij')
-    axes[2].scatter(Xp2.ravel(), Zp2.ravel(), s=2, label='Grid faces')
+    _draw_grid(axes[2], x_coords, z_coords, x_range, z_range)
     if mesh is not None:
         verts = mesh.vertices
         axes[2].scatter(verts[:, 0], verts[:, 2], s=1, alpha=0.3, color='gray', label='Geometry verts')
     axes[2].set_xlabel('x')
     axes[2].set_ylabel('z')
-    axes[2].set_title('XZ grid faces')
-    axes[2].axis('equal')
-    # axes[2].legend()
+    axes[2].set_title(f'XZ grid faces ({len(x_coords)}×{len(z_coords)})')
+    axes[2].set_aspect('equal', adjustable='box')
+
     plt.tight_layout()
     plt.show()
 
