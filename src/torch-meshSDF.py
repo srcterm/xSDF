@@ -484,6 +484,33 @@ def _apply_sign_to_distances(
 
 # ------------------------------------------------------------------ FWN pipeline
 
+def _cdist_vertex_warmstart(
+    P: torch.Tensor,
+    V: torch.Tensor,
+    memory_budget_gb: float,
+) -> torch.Tensor:
+    """Tiled point-to-vertex cdist. Returns (N,) upper bounds on d_surface.
+
+    Valid because min_i ||p - v_i|| >= d_surface for any triangle: the
+    closest surface point is never farther than that triangle's closest
+    vertex. Used as a tighter seed for bvh_min_distance_gpu than the
+    early-outed d_upper from classify_band.
+    """
+    N = int(P.shape[0])
+    nV = int(V.shape[0])
+    if N == 0 or nV == 0:
+        return torch.empty((N,), dtype=torch.float32, device=P.device)
+    bytes_per_pair = 4  # float32
+    budget = max(1, int(memory_budget_gb * 1e9) // (nV * bytes_per_pair))
+    chunk = min(N, budget)
+    out = torch.empty((N,), dtype=torch.float32, device=P.device)
+    for i in range(0, N, chunk):
+        j = min(i + chunk, N)
+        d = torch.cdist(P[i:j], V)
+        out[i:j] = d.amin(dim=1)
+    return out
+
+
 def _run_fwn_pipeline(
     V: torch.Tensor,
     F: torch.Tensor,
@@ -496,6 +523,8 @@ def _run_fwn_pipeline(
     band_width_cells: float,
     bvh_leaf_size: int,
     bvh_build_device: str,
+    memory_budget_gb: float = 2.0,
+    use_cdist_warmstart: bool = True,
 ) -> torch.Tensor:
     """All-GPU SDF via skip-pointer BVH + Barill FWN + flood-fill + fast sweep.
 
@@ -561,11 +590,18 @@ def _run_fwn_pipeline(
         sign_band = torch.where(w_band > 0.5, -1.0, 1.0).to(torch.float32)
         print(f"[FWN] fwn_query: {(time.time()-t2)*1000:.1f}ms")
 
+        warm = d_upper[band_idx]
+        if use_cdist_warmstart:
+            tc = time.time()
+            d_cdist = _cdist_vertex_warmstart(P_band, V, memory_budget_gb * 0.25)
+            warm = torch.minimum(warm, d_cdist)
+            print(f"[FWN] cdist_warmstart: {(time.time()-tc)*1000:.1f}ms")
+
         t3 = time.time()
         d_band = _bvh_mod.bvh_min_distance_gpu(
             P_band, bvh, V, F,
             max_reasonable_dist=float(max_reasonable_dist),
-            initial_upper=d_upper[band_idx],
+            initial_upper=warm,
         )
         print(f"[FWN] bvh_min_distance_gpu: {(time.time()-t3)*1000:.1f}ms")
 
@@ -612,6 +648,7 @@ def mesh_to_sdf_torch(
     target_memory_gb: Optional[float] = None,
     fwn_beta: float = 2.0,
     fwn_band_width_cells: float = 2.0,
+    fwn_cdist_warmstart: bool = True,
 ):
     """
     Compute signed distance field (SDF) using PyTorch with automatic chunking and AABB acceleration.
@@ -716,6 +753,8 @@ def mesh_to_sdf_torch(
             band_width_cells=fwn_band_width_cells,
             bvh_leaf_size=bvh_leaf_size,
             bvh_build_device=bvh_build_device,
+            memory_budget_gb=float(target_memory_gb) if target_memory_gb else 2.0,
+            use_cdist_warmstart=fwn_cdist_warmstart,
         )
         phi = phi_3d.reshape(-1)
     elif mode == "bvh":

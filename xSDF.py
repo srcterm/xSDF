@@ -139,6 +139,7 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
           bvh_build_device: str = 'cpu',
           fwn_beta: float = 2.0,
           fwn_band_width_cells: float = 2.0,
+          fwn_cdist_warmstart: bool = True,
           compile_kernels=False,
           # Grid coordinate options (non-uniform by default, set r_max=1.0 for uniform)
           stretch_axes: Optional[Dict[str, Dict]] = None,
@@ -265,6 +266,7 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
             target_memory_gb=memory_budget_gb,
             fwn_beta=fwn_beta,
             fwn_band_width_cells=fwn_band_width_cells,
+            fwn_cdist_warmstart=fwn_cdist_warmstart,
         )
         sdf = res.phi
         origin = res.origin
@@ -347,6 +349,7 @@ if __name__ == "__main__":
         bvh_build_device=torch_cfg.get('bvh_build_device', 'cpu'),
         fwn_beta=torch_cfg.get('fwn_beta', 2.0),
         fwn_band_width_cells=torch_cfg.get('fwn_band_width_cells', 2.0),
+        fwn_cdist_warmstart=torch_cfg.get('fwn_cdist_warmstart', True),
         compile_kernels=torch_cfg.get('compile_kernels', False),
     )
 
