@@ -29,6 +29,7 @@ def classify_band(
     F: torch.Tensor,
     band_threshold: float,
     bvh_mod,
+    initial_upper: "torch.Tensor | None" = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Mark which query points lie within ``band_threshold`` of the mesh.
 
@@ -36,10 +37,17 @@ def classify_band(
     to ``band_threshold`` so the traversal aggressively prunes cells whose
     true distance exceeds the threshold. Returns a boolean mask plus the
     tight upper-bound tensor (useful for seeding downstream kernels).
+
+    Args:
+        initial_upper: optional pre-computed upper bound on ``|d|`` per point
+            (e.g. a point-to-vertex cdist seed clamped to ``band_threshold``).
+            Forwarded to ``bvh_min_distance_gpu``; cells that already prove
+            sub-threshold via the seed retire at iter 0.
     """
     d_upper = bvh_mod.bvh_min_distance_gpu(
         P, bvh, V, F,
         max_reasonable_dist=band_threshold,
+        initial_upper=initial_upper,
         early_out_threshold=band_threshold,
     )
     band_mask = d_upper < band_threshold

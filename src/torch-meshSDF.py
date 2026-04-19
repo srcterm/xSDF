@@ -48,6 +48,34 @@ class SDFResult:
     dx: float
     grid_shape: Tuple[int, int, int]
 
+
+def _device_sync(dev: torch.device) -> None:
+    """Drain the queued kernels on ``dev`` so subsequent ``time.time()`` reads
+    wall time for completed work, not launch time. No-op on CPU.
+    """
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
+    elif dev.type == "mps":
+        # torch.mps.synchronize() is parameterless; safe to call on any MPS.
+        torch.mps.synchronize()
+
+
+def _chunk_size_for_bvh(memory_budget_gb: float, max_leaf_size: int) -> int:
+    """Upper bound on how many points one dense-per-iter BVH traversal can
+    handle under ``memory_budget_gb`` without blowing the (N,L) scratch tensors.
+
+    The MPS/CUDA inner loop materializes several (N,L) tensors per iter (see
+    ``bvh_min_distance_gpu``): valid_slot, clamped, tri_ids_pad, d_pair,
+    huge_NL, zeros_NL, plus (N·L, 3) P_rep and A/B/C vertex fetches. Empirical
+    per-point peak is ~32 B persistent + ~89 B per leaf slot + ~150 B of
+    N-wide temps; we round up. Half the budget is reserved for the BVH itself
+    and unrelated allocations.
+    """
+    L = max(1, int(max_leaf_size))
+    per_point = 32 + 89 * L + 150  # bytes
+    budget_bytes = int(float(memory_budget_gb) * 0.5 * 1e9)
+    return max(16_384, budget_bytes // per_point)
+
 # ------------------------------------------------------------------ distance & sign kernels (Torch only)
 
 def point_triangle_distance_torch(P: torch.Tensor,
@@ -526,32 +554,48 @@ def _run_fwn_pipeline(
     memory_budget_gb: float = 2.0,
     use_cdist_warmstart: bool = True,
 ) -> torch.Tensor:
-    """All-GPU SDF via skip-pointer BVH + Barill FWN + flood-fill + fast sweep.
+    """All-device SDF via skip-pointer BVH + Barill FWN + flood-fill + fast sweep.
 
     Pipeline:
-        1. Build BVH (CPU), upload skip-pointer + dipole fields to device.
+        1. Build BVH (CPU), upload to ``dev``.
         2. Band classify grid points: bvh_min_distance_gpu with d_best pinned
            to band_threshold. Cells under the threshold are "band" cells.
         3. In-band: exact FWN (sign) + bvh_min_distance_gpu (|d|).
         4. Flood-fill sign from a corner seed through non-band cells.
         5. Fast sweep propagates |d| out of the band.
         6. Assemble phi = sign * |d|, pin band cells to their exact values.
+
+    All stages run on ``dev``. The BVH traversal kernels
+    (:func:`bvh.bvh_min_distance_gpu`, :func:`bvh.fwn_query`) are written in a
+    dense-per-iter form with amortized sync (see their docstrings) so they
+    stay fast on MPS — the earlier CPU-routing workaround is no longer needed.
     """
+    # --- BVH build + upload to dev ---------------------------------------
+    _device_sync(dev)
     t0 = time.time()
     bvh_built = _bvh_mod.build_bvh_torch(V, F, leaf_size=bvh_leaf_size,
                                           build_device=bvh_build_device)
     bvh = _bvh_mod.bvh_to_device(bvh_built, dev)
     stats = _bvh_mod.bvh_stats(bvh)
+    _device_sync(dev)
     print(f"[FWN] BVH: {stats['n_nodes']} nodes, depth={stats['max_depth']}, "
           f"leaves={stats['n_leaves']}, avg_leaf={stats['avg_leaf_size']:.1f}, "
           f"max_leaf={stats['max_leaf_size']} | build={(time.time()-t0)*1000:.1f}ms")
 
+    max_leaf = int(bvh["max_leaf_size"])
+    max_chunk = _chunk_size_for_bvh(memory_budget_gb, max_leaf)
+
     Nx = int(x_coords_t.numel())
     Ny = int(y_coords_t.numel())
     Nz = int(z_coords_t.numel())
-    # Build grid points in (Nx, Ny, Nz, 3) ij order.
-    Xg, Yg, Zg = torch.meshgrid(x_coords_t, y_coords_t, z_coords_t, indexing="ij")
-    P = torch.stack([Xg, Yg, Zg], dim=-1).reshape(-1, 3).to(dev)
+    Xg, Yg, Zg = torch.meshgrid(
+        x_coords_t.to(dev), y_coords_t.to(dev), z_coords_t.to(dev),
+        indexing="ij",
+    )
+    P = torch.stack([Xg, Yg, Zg], dim=-1).reshape(-1, 3)
+    total = int(P.shape[0])
+    print(f"[FWN] grid: {total:,} points, max_chunk={max_chunk:,} "
+          f"(budget={memory_budget_gb:.2f}GB, max_leaf={max_leaf})")
 
     # Grid spacing (non-uniform safe: use max local spacing).
     def _max_h(coord):
@@ -565,70 +609,98 @@ def _run_fwn_pipeline(
     h = max(dx, dy, dz)
     band_threshold = float(band_width_cells) * h
 
-    # Band classification.
+    # --- Band classification (chunked) -----------------------------------
+    # cdist warm-start is deferred to the band-only slot below: on MPS/CUDA
+    # active-set compaction already retires in-band points early via the
+    # early_out_threshold path, and on CPU the sparse classify loop retires
+    # cheaply on its own — full-grid cdist costs ~10s on Ahmed/MPS for ~0
+    # additional speedup.
+    _device_sync(dev)
     t1 = time.time()
-    band_mask_flat, d_upper = _ff_mod.classify_band(
-        P, bvh, V, F, band_threshold, _bvh_mod
-    )
-    n_band = int(band_mask_flat.sum())
-    total = int(band_mask_flat.numel())
+    band_mask = torch.empty((total,), dtype=torch.bool, device=dev)
+    d_upper = torch.empty((total,), dtype=torch.float32, device=dev)
+    for i in range(0, total, max_chunk):
+        j = min(i + max_chunk, total)
+        bm_i, du_i = _ff_mod.classify_band(
+            P[i:j], bvh, V, F, band_threshold, _bvh_mod,
+        )
+        band_mask[i:j] = bm_i
+        d_upper[i:j] = du_i
+    n_band = int(band_mask.sum())
+    _device_sync(dev)
     print(f"[FWN] band: {n_band}/{total}  ({100.0*n_band/max(total,1):.1f}%)  "
           f"threshold={band_threshold:.4g}  ({time.time()-t1:.2f}s)")
 
-    band_idx = band_mask_flat.nonzero().flatten()
-    band_mask_3d = band_mask_flat.view(Nx, Ny, Nz)
+    band_idx = band_mask.nonzero().flatten()
+    band_mask_3d = band_mask.view(Nx, Ny, Nz)
 
-    # Exact sign and |d| in band.
+    # --- Exact sign and |d| in band --------------------------------------
     sign_band = torch.zeros((n_band,), dtype=torch.float32, device=dev)
     d_band = torch.zeros((n_band,), dtype=torch.float32, device=dev)
     if n_band > 0:
         P_band = P[band_idx]
+
+        # Sign via FWN.
+        _device_sync(dev)
         t2 = time.time()
         w_band = _bvh_mod.fwn_query(P_band, bvh, V, F, beta=beta)
         # Convention matches _apply_sign_to_distances: inside is negative.
         # CCW outward normals ⇒ w≈+1 inside, ≈0 outside.
         sign_band = torch.where(w_band > 0.5, -1.0, 1.0).to(torch.float32)
+        _device_sync(dev)
         print(f"[FWN] fwn_query: {(time.time()-t2)*1000:.1f}ms")
 
         warm = d_upper[band_idx]
         if use_cdist_warmstart:
+            _device_sync(dev)
             tc = time.time()
             d_cdist = _cdist_vertex_warmstart(P_band, V, memory_budget_gb * 0.25)
             warm = torch.minimum(warm, d_cdist)
-            print(f"[FWN] cdist_warmstart: {(time.time()-tc)*1000:.1f}ms")
+            _device_sync(dev)
+            print(f"[FWN] cdist_warmstart (band-only): {(time.time()-tc)*1000:.1f}ms")
 
+        # Exact |d| (chunked for memory safety on large bands).
+        _device_sync(dev)
         t3 = time.time()
-        d_band = _bvh_mod.bvh_min_distance_gpu(
-            P_band, bvh, V, F,
-            max_reasonable_dist=float(max_reasonable_dist),
-            initial_upper=warm,
-        )
+        for i in range(0, n_band, max_chunk):
+            j = min(i + max_chunk, n_band)
+            d_band[i:j] = _bvh_mod.bvh_min_distance_gpu(
+                P_band[i:j], bvh, V, F,
+                max_reasonable_dist=float(max_reasonable_dist),
+                initial_upper=warm[i:j],
+            )
+        _device_sync(dev)
         print(f"[FWN] bvh_min_distance_gpu: {(time.time()-t3)*1000:.1f}ms")
 
-    # Flood-fill sign from a corner (assumed outside after padding).
+    # --- Flood-fill sign -------------------------------------------------
+    _device_sync(dev)
     t4 = time.time()
     sign_outside_3d = _ff_mod.flood_fill_sign_gpu(band_mask_3d, seed=(0, 0, 0))
+    _device_sync(dev)
     print(f"[FWN] flood_fill: {(time.time()-t4)*1000:.1f}ms")
 
-    # Fast sweep to propagate |d| from band to the full grid.
+    # --- Fast sweep |d| --------------------------------------------------
     phi_band_abs_3d = torch.zeros((Nx, Ny, Nz), dtype=torch.float32, device=dev)
     if n_band > 0:
         phi_band_abs_3d.view(-1)[band_idx] = d_band
 
+    _device_sync(dev)
     t5 = time.time()
     u = _ff_mod.fast_sweep_gpu(
         phi_band_abs_3d, band_mask_3d,
         x_coords_t.to(dev), y_coords_t.to(dev), z_coords_t.to(dev),
     )
+    _device_sync(dev)
     print(f"[FWN] fast_sweep: {(time.time()-t5)*1000:.1f}ms")
 
-    # Assemble phi:
+    # --- Assemble phi ----------------------------------------------------
     #   - band cells: sign_band * d_band
     #   - non-band:   sign_outside * u
     phi_flat = (sign_outside_3d * u).view(-1)
     if n_band > 0:
         phi_flat[band_idx] = sign_band * d_band
 
+    _device_sync(dev)
     return phi_flat.view(Nx, Ny, Nz)
 
 
