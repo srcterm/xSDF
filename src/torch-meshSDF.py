@@ -1,9 +1,19 @@
 # Set MPS fallback policy before importing torch
 import os
+import sys
+import importlib.util
+import time
 import numpy as np
 import math, torch
 from dataclasses import dataclass
 from typing import Tuple, Optional
+
+# Load sibling LBVH module (hyphenated filename forces importlib dance here too).
+_LBVH_FILE = os.path.join(os.path.dirname(__file__), "lbvh.py")
+_lbvh_spec = importlib.util.spec_from_file_location("lbvh", _LBVH_FILE)
+lbvh = importlib.util.module_from_spec(_lbvh_spec)
+sys.modules["lbvh"] = lbvh
+_lbvh_spec.loader.exec_module(lbvh)
 
 # ------------------------------------------------------------------ utilities
 def pick_device(prefer: Optional[str] = None) -> torch.device:
@@ -599,3 +609,297 @@ def mesh_to_sdf_torch(
 
     # Always return numpy arrays
     return SDFResult(phi.cpu().float().numpy(), origin.cpu().float().numpy(), dx_out, (nx, ny, nz))
+
+
+# ============================================================================
+# Phase 2: LBVH full-grid unsigned distance (|d|) with cdist warm-start.
+# Stage 2 of the final pipeline; signing (flood fill + Barill FWN) is added in
+# Phases 3–5. During Phase 2, mesh_to_sdf_torch_v2 returns U (unsigned |d|) as
+# the phi field so the integration path stays runnable end-to-end.
+# ============================================================================
+
+def _pairwise_point_triangle_dist(P: torch.Tensor,
+                                   A: torch.Tensor,
+                                   B: torch.Tensor,
+                                   C: torch.Tensor) -> torch.Tensor:
+    """Unsigned distance between P_i and triangle (A_i, B_i, C_i). All (N, 3).
+
+    Ericson 6-region test, paired (no outer product). Used inside the leaf
+    distance loop where every query has its own (≤ leaf_size) triangles.
+    """
+    AB = B - A
+    AC = C - A
+    AP = P - A
+    d1 = (AP * AB).sum(-1)
+    d2 = (AP * AC).sum(-1)
+
+    BP = P - B
+    d3 = (BP * AB).sum(-1)
+    d4 = (BP * AC).sum(-1)
+
+    CP = P - C
+    d5 = (CP * AB).sum(-1)
+    d6 = (CP * AC).sum(-1)
+
+    maskA  = (d1 <= 0.0) & (d2 <= 0.0)
+    maskB  = (d3 >= 0.0) & (d4 <= d3)
+    maskC  = (d6 >= 0.0) & (d5 <= d6)
+
+    vc = d1 * d4 - d3 * d2
+    maskAB = (vc <= 0.0) & (d1 >= 0.0) & (d3 <= 0.0)
+    v = d1 / (d1 - d3).clamp_min(1e-20) * (d1 >= 0).to(P.dtype)
+    v = torch.where((d1 - d3).abs() > 1e-20, d1 / (d1 - d3 + 1e-20), torch.zeros_like(d1))
+
+    vb = d5 * d2 - d1 * d6
+    maskAC = (vb <= 0.0) & (d2 >= 0.0) & (d6 <= 0.0)
+    w = torch.where((d2 - d6).abs() > 1e-20, d2 / (d2 - d6 + 1e-20), torch.zeros_like(d2))
+
+    va = d3 * d6 - d5 * d4
+    denomBC = (d4 - d3) + (d5 - d6)
+    t = torch.where(denomBC.abs() > 1e-20,
+                    (d4 - d3) / (denomBC + 1e-20),
+                    torch.zeros_like(denomBC))
+    maskBC = (va <= 0.0) & ((d4 - d3) >= 0.0) & ((d5 - d6) >= 0.0)
+
+    maskFace = ~(maskA | maskB | maskC | maskAB | maskAC | maskBC)
+
+    projAB = A + v.unsqueeze(-1) * AB
+    projAC = A + w.unsqueeze(-1) * AC
+    projBC = B + t.unsqueeze(-1) * (C - B)
+
+    N = torch.linalg.cross(AB, AC, dim=-1)
+    N_norm = torch.linalg.norm(N, dim=-1).clamp_min(1e-20)
+    N_unit = N / N_norm.unsqueeze(-1)
+    dist_plane = (AP * N_unit).sum(-1).abs()
+
+    huge = torch.full_like(d1, 1e20)
+    d = huge
+    d = torch.minimum(d, torch.where(maskA,    torch.linalg.norm(AP, dim=-1),          huge))
+    d = torch.minimum(d, torch.where(maskB,    torch.linalg.norm(BP, dim=-1),          huge))
+    d = torch.minimum(d, torch.where(maskC,    torch.linalg.norm(CP, dim=-1),          huge))
+    d = torch.minimum(d, torch.where(maskAB,   torch.linalg.norm(P - projAB, dim=-1),  huge))
+    d = torch.minimum(d, torch.where(maskAC,   torch.linalg.norm(P - projAC, dim=-1),  huge))
+    d = torch.minimum(d, torch.where(maskBC,   torch.linalg.norm(P - projBC, dim=-1),  huge))
+    d = torch.minimum(d, torch.where(maskFace, dist_plane,                             huge))
+    return d
+
+
+def _cdist_warmstart(Q: torch.Tensor,
+                     V: torch.Tensor,
+                     target_memory_gb: float,
+                     verbose: bool = False) -> torch.Tensor:
+    """Tiled point-to-vertex min distance as a tight initial upper bound.
+
+    Plan default: QB=4096, VB=32768 costing ≈ 0.5 GB scratch at 8 GB budget.
+    Shrinks tiles if the backend OOMs — MPS in particular can fail on a single
+    large cdist even if we've budgeted for it.
+    """
+    Nq = Q.shape[0]
+    Nv = V.shape[0]
+    dev = Q.device
+
+    scratch_bytes = max(0.5, target_memory_gb * 0.0625) * (1024 ** 3)
+    VB = min(Nv, 32768)
+    QB = max(128, min(Nq, int(scratch_bytes / max(VB * 4, 1))))
+    QB = min(QB, 4096)
+
+    d_best = torch.full((Nq,), float("inf"), dtype=torch.float32, device=dev)
+
+    q0 = 0
+    while q0 < Nq:
+        q1 = min(q0 + QB, Nq)
+        pts = Q[q0:q1]
+        block_min: Optional[torch.Tensor] = None
+        v0 = 0
+        while v0 < Nv:
+            v1 = min(v0 + VB, Nv)
+            try:
+                d_block = torch.cdist(pts, V[v0:v1])            # (qb, vb)
+                m = d_block.min(dim=1).values
+            except RuntimeError as exc:
+                # Shrink VB on OOM, retry this tile.
+                if VB > 2048:
+                    VB = max(2048, VB // 2)
+                    if verbose:
+                        print(f"[cdist] OOM; shrunk VB → {VB}")
+                    continue
+                raise
+            block_min = m if block_min is None else torch.minimum(block_min, m)
+            v0 = v1
+        d_best[q0:q1] = block_min  # type: ignore[arg-type]
+        q0 = q1
+    return d_best
+
+
+def _lbvh_unsigned_distance(bvh: "lbvh.LBVH",
+                            Q: torch.Tensor,
+                            d_best: torch.Tensor,
+                            verbose: bool = False) -> torch.Tensor:
+    """Stackless LBVH traversal producing unsigned distance.
+
+    Every iteration: gather (cur_node → AABB), prune by d_lo > d_best, process
+    leaves against their 1..leaf_size triangles, advance left or skip. Active
+    set is compacted every 32 iterations to shed finished queries.
+    """
+    dev = Q.device
+    Nq = Q.shape[0]
+    L = bvh.num_leaves
+    leaf_threshold = L - 1
+    leaf_size = bvh.leaf_size
+    Nt = bvh.F.shape[0]
+
+    cur_node = torch.zeros(Nq, dtype=torch.int32, device=dev)  # root for everyone
+    active = torch.arange(Nq, dtype=torch.long, device=dev)
+
+    V = bvh.V
+    F = bvh.F
+    aabb_min = bvh.aabb_min
+    aabb_max = bvh.aabb_max
+    left = bvh.left
+    skip = bvh.skip
+    tri_order = bvh.tri_order.to(torch.long) if bvh.tri_order.dtype != torch.long else bvh.tri_order
+    leaf_beg = bvh.leaf_tri_beg.to(torch.long)
+    leaf_end = bvh.leaf_tri_end.to(torch.long)
+
+    max_iters = 4 * bvh.num_nodes + 64
+    neg_one = torch.full((1,), -1, dtype=torch.int32, device=dev)
+
+    for it in range(max_iters):
+        if active.numel() == 0:
+            if verbose:
+                print(f"[lbvh traversal] converged after {it} iters")
+            break
+
+        n = cur_node.index_select(0, active)                  # (A,) int32
+        valid = n != -1
+        n_safe = n.clamp_min(0).to(torch.long)
+
+        p = Q.index_select(0, active)
+        nm = aabb_min.index_select(0, n_safe)
+        nM = aabb_max.index_select(0, n_safe)
+        clamped = torch.minimum(torch.maximum(p, nm), nM)
+        d_lo = torch.linalg.norm(p - clamped, dim=-1)
+
+        best_cur = d_best.index_select(0, active)
+        pruned = d_lo >= best_cur
+        is_leaf = n >= leaf_threshold
+
+        process_leaf = is_leaf & ~pruned & valid
+        if bool(process_leaf.any()):
+            sub = process_leaf.nonzero(as_tuple=True)[0]      # (Nl,)
+            glob = active.index_select(0, sub)
+            leaf_k = (n.index_select(0, sub) - leaf_threshold).to(torch.long)
+            beg = leaf_beg.index_select(0, leaf_k)
+            end = leaf_end.index_select(0, leaf_k)
+            pts = p.index_select(0, sub)
+            best_upd = best_cur.index_select(0, sub)
+
+            for off in range(leaf_size):
+                tri_pos = beg + off
+                has_tri = tri_pos < end
+                if not bool(has_tri.any()):
+                    break
+                tri_pos_safe = tri_pos.clamp_max(Nt - 1)
+                tri_orig = tri_order.index_select(0, tri_pos_safe)
+                f = F.index_select(0, tri_orig)
+                A = V.index_select(0, f[:, 0])
+                B = V.index_select(0, f[:, 1])
+                C = V.index_select(0, f[:, 2])
+                d_tri = _pairwise_point_triangle_dist(pts, A, B, C)
+                d_tri = torch.where(has_tri, d_tri, torch.full_like(d_tri, float("inf")))
+                best_upd = torch.minimum(best_upd, d_tri)
+
+            d_best.scatter_(0, glob, best_upd)
+
+        advance = is_leaf | pruned
+        left_n = left.index_select(0, n_safe)
+        skip_n = skip.index_select(0, n_safe)
+        nxt = torch.where(advance, skip_n, left_n)
+        nxt = torch.where(valid, nxt, neg_one.expand_as(nxt))
+        cur_node.scatter_(0, active, nxt)
+
+        if (it & 31) == 31:
+            alive_mask = cur_node.index_select(0, active) != -1
+            if not bool(alive_mask.all()):
+                active = active[alive_mask]
+
+    return d_best
+
+
+def mesh_to_sdf_torch_v2(
+    V_np,
+    F_np,
+    x_coords: np.ndarray,
+    y_coords: np.ndarray,
+    z_coords: np.ndarray,
+    *,
+    device: Optional[str] = None,
+    fwn_beta: float = 2.0,
+    fwn_band_width_cells: float = 3.0,
+    cos_theta_min: float = 0.8,
+    target_memory_gb: Optional[float] = None,
+    verbose: bool = True,
+) -> SDFResult:
+    """LBVH + Barill FWN SDF pipeline entry point.
+
+    Phase 2 status: unsigned distance via LBVH traversal + cdist warm-start
+    is live. The returned phi is the unsigned field |d| (no sign yet); sign
+    comes online in Phases 3–5 (gradient, flood fill, exact FWN).
+    """
+    dev = pick_device(device)
+    if dev.type == "mps":
+        os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
+    if verbose:
+        print(f"[v2] Phase 2  device={dev}  "
+              f"fwn_beta={fwn_beta} band={fwn_band_width_cells} cos_theta_min={cos_theta_min}")
+
+    mem_budget = 8.0 if target_memory_gb is None else float(target_memory_gb)
+
+    # ---- Grid assembly ----
+    x_t = torch.as_tensor(x_coords, dtype=torch.float32, device=dev)
+    y_t = torch.as_tensor(y_coords, dtype=torch.float32, device=dev)
+    z_t = torch.as_tensor(z_coords, dtype=torch.float32, device=dev)
+    nx, ny, nz = x_t.numel(), y_t.numel(), z_t.numel()
+
+    X, Y, Z = torch.meshgrid(x_t, y_t, z_t, indexing="ij")
+    Q = torch.stack([X, Y, Z], dim=-1).reshape(-1, 3)          # (Nq, 3)
+    Nq = Q.shape[0]
+    origin = torch.tensor([x_t[0].item(), y_t[0].item(), z_t[0].item()],
+                          dtype=torch.float32)
+
+    # ---- Build LBVH ----
+    t0 = time.time()
+    V = torch.as_tensor(V_np, dtype=torch.float32, device=dev)
+    F = torch.as_tensor(F_np, dtype=torch.int64, device=dev)
+    bvh = lbvh.build_lbvh(V, F, leaf_size=4)
+    if verbose:
+        print(f"[lbvh] Nt={F.shape[0]} L={bvh.num_leaves} nodes={bvh.num_nodes} "
+              f"built in {time.time() - t0:.3f}s")
+
+    # ---- cdist warm-start: tight upper bound per query ----
+    t0 = time.time()
+    d_best = _cdist_warmstart(Q, V, mem_budget, verbose=verbose)
+    if verbose:
+        print(f"[cdist] warm-start {time.time() - t0:.3f}s  "
+              f"d_best range=[{float(d_best.min()):.4f}, {float(d_best.max()):.4f}]")
+
+    # ---- Full-grid unsigned distance traversal ----
+    t0 = time.time()
+    d_best = _lbvh_unsigned_distance(bvh, Q, d_best, verbose=verbose)
+    if verbose:
+        print(f"[traversal] {time.time() - t0:.3f}s  "
+              f"|d| range=[{float(d_best.min()):.4f}, {float(d_best.max()):.4f}]")
+
+    # ---- Placeholder phi = U (unsigned). Sign is Phase 3–5. ----
+    phi = d_best.reshape(nx, ny, nz)
+
+    # dx scalar only if the grid is uniform (same as legacy).
+    dx_out = float("nan")
+    if nx > 1 and ny > 1 and nz > 1:
+        dx_x = float(x_t[1] - x_t[0])
+        dx_y = float(y_t[1] - y_t[0])
+        dx_z = float(z_t[1] - z_t[0])
+        if abs(dx_x - dx_y) < 1e-6 and abs(dx_x - dx_z) < 1e-6:
+            dx_out = dx_x
+
+    return SDFResult(phi.cpu().numpy(), origin.numpy(), dx_out, (nx, ny, nz))
