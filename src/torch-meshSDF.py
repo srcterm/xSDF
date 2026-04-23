@@ -826,6 +826,146 @@ def _lbvh_unsigned_distance(bvh: "lbvh.LBVH",
     return d_best
 
 
+# =============================================================================
+# Phase 5: Barill hierarchical fast winding number (FWN)
+# =============================================================================
+
+_INV_4PI = 1.0 / (4.0 * math.pi)
+
+
+def _lbvh_fwn_winding(bvh: "lbvh.LBVH",
+                      Q: torch.Tensor,
+                      beta: float = 2.0,
+                      verbose: bool = False) -> torch.Tensor:
+    """Stackless LBVH traversal producing the generalized winding number w(p).
+
+    At every step, for each active query's current node n:
+      - leaf   → evaluate exact Van Oosterom–Strackee solid angle on the
+                 leaf's 1..leaf_size triangles, advance via skip[n].
+      - internal, admissible (||p − c_node|| > β · r_ball[n])
+               → accept the dipole Δw = (1/4π) · n_area · (c_node − p) / r³,
+                 advance via skip[n].
+      - internal, not admissible → descend via left[n].
+
+    Admissibility uses c_node = c_area / area_w (precomputed-on-demand) and
+    the tight per-axis-max r_ball set by the LBVH builder. Mirrors the Phase 2
+    driver: active-set compaction every 32 iters keeps the kernel shape tight.
+    """
+    dev = Q.device
+    Nq = Q.shape[0]
+    if Nq == 0:
+        return torch.zeros(0, dtype=torch.float32, device=dev)
+
+    L = bvh.num_leaves
+    leaf_threshold = L - 1
+    leaf_size = bvh.leaf_size
+    Nt = bvh.F.shape[0]
+    assert bvh.area_w is not None, "LBVH must carry dipole fields for FWN"
+
+    w_accum = torch.zeros(Nq, dtype=torch.float32, device=dev)
+    cur_node = torch.zeros(Nq, dtype=torch.int32, device=dev)
+    active = torch.arange(Nq, dtype=torch.long, device=dev)
+
+    V = bvh.V
+    F = bvh.F
+    left = bvh.left
+    skip = bvh.skip
+    area_w = bvh.area_w
+    c_area = bvh.c_area
+    n_area = bvh.n_area
+    r_ball = bvh.r_ball
+    tri_order = bvh.tri_order.to(torch.long) if bvh.tri_order.dtype != torch.long else bvh.tri_order
+    leaf_beg = bvh.leaf_tri_beg.to(torch.long)
+    leaf_end = bvh.leaf_tri_end.to(torch.long)
+
+    max_iters = 4 * bvh.num_nodes + 64
+    neg_one = torch.full((1,), -1, dtype=torch.int32, device=dev)
+    eps_denom = 1e-20
+
+    for it in range(max_iters):
+        if active.numel() == 0:
+            if verbose:
+                print(f"[fwn traversal] converged after {it} iters")
+            break
+
+        n = cur_node.index_select(0, active)                  # (A,) int32
+        valid = n != -1
+        n_safe = n.clamp_min(0).to(torch.long)
+        p = Q.index_select(0, active)                         # (A, 3)
+
+        is_leaf = n >= leaf_threshold
+        is_internal = (~is_leaf) & valid
+
+        # ---- Internal node: admissibility vs descend ----
+        aw = area_w.index_select(0, n_safe).clamp_min(1e-30)
+        c_node = c_area.index_select(0, n_safe) / aw.unsqueeze(1)
+        diff = c_node - p                                     # (A, 3)
+        r2 = (diff * diff).sum(dim=-1)
+        r = torch.sqrt(r2.clamp_min(eps_denom))
+        rball_n = r_ball.index_select(0, n_safe)
+        admissible = (r > beta * rball_n) & is_internal
+
+        if bool(admissible.any()):
+            sub = admissible.nonzero(as_tuple=True)[0]
+            glob = active.index_select(0, sub)
+            n_a = n_area.index_select(0, n_safe.index_select(0, sub))   # (M, 3)
+            d_a = diff.index_select(0, sub)                             # (M, 3)
+            r3 = r.index_select(0, sub).pow(3).clamp_min(eps_denom)
+            dw = (n_a * d_a).sum(dim=-1) * (_INV_4PI / r3)
+            w_accum.scatter_add_(0, glob, dw)
+
+        # ---- Leaf: exact VOS per triangle ----
+        process_leaf = is_leaf & valid
+        if bool(process_leaf.any()):
+            sub = process_leaf.nonzero(as_tuple=True)[0]      # (Nl,)
+            glob = active.index_select(0, sub)
+            leaf_k = (n.index_select(0, sub) - leaf_threshold).to(torch.long)
+            beg = leaf_beg.index_select(0, leaf_k)
+            end = leaf_end.index_select(0, leaf_k)
+            pts = p.index_select(0, sub)                      # (Nl, 3)
+            omega_sum = torch.zeros(pts.shape[0], dtype=torch.float32, device=dev)
+
+            for off in range(leaf_size):
+                tri_pos = beg + off
+                has_tri = tri_pos < end
+                if not bool(has_tri.any()):
+                    break
+                tri_pos_safe = tri_pos.clamp_max(Nt - 1)
+                tri_orig = tri_order.index_select(0, tri_pos_safe)
+                f = F.index_select(0, tri_orig)
+                A = V.index_select(0, f[:, 0]) - pts
+                B = V.index_select(0, f[:, 1]) - pts
+                C = V.index_select(0, f[:, 2]) - pts
+                a_len = torch.linalg.norm(A, dim=-1)
+                b_len = torch.linalg.norm(B, dim=-1)
+                c_len = torch.linalg.norm(C, dim=-1)
+                num = (A * torch.linalg.cross(B, C, dim=-1)).sum(dim=-1)
+                ab = (A * B).sum(dim=-1)
+                bc = (B * C).sum(dim=-1)
+                ca = (C * A).sum(dim=-1)
+                denom = a_len * b_len * c_len + ab * c_len + bc * a_len + ca * b_len + eps_denom
+                omega_tri = 2.0 * torch.atan2(num, denom)
+                omega_tri = torch.where(has_tri, omega_tri, torch.zeros_like(omega_tri))
+                omega_sum = omega_sum + omega_tri
+
+            w_accum.scatter_add_(0, glob, omega_sum * _INV_4PI)
+
+        # ---- Advance: leaves + admissibles skip; descend internals use left ----
+        advance = is_leaf | admissible
+        left_n = left.index_select(0, n_safe)
+        skip_n = skip.index_select(0, n_safe)
+        nxt = torch.where(advance, skip_n, left_n)
+        nxt = torch.where(valid, nxt, neg_one.expand_as(nxt))
+        cur_node.scatter_(0, active, nxt)
+
+        if (it & 31) == 31:
+            alive_mask = cur_node.index_select(0, active) != -1
+            if not bool(alive_mask.all()):
+                active = active[alive_mask]
+
+    return w_accum
+
+
 def _compute_dx_local_max(x_t: torch.Tensor,
                            y_t: torch.Tensor,
                            z_t: torch.Tensor) -> torch.Tensor:
@@ -1086,15 +1226,21 @@ def mesh_to_sdf_torch_v2(
 ) -> SDFResult:
     """LBVH + Barill FWN SDF pipeline entry point.
 
-    Phase 2 status: unsigned distance via LBVH traversal + cdist warm-start
-    is live. The returned phi is the unsigned field |d| (no sign yet); sign
-    comes online in Phases 3–5 (gradient, flood fill, exact FWN).
+    Pipeline (Phase 5 complete):
+      1. Build LBVH (Karras 2012) on device.
+      2. cdist vertex-min warm-start (upper bound per query).
+      3. Stackless LBVH traversal → exact unsigned distance |d|.
+      4. Central-difference gradient on the non-uniform grid.
+      5. Narrow-band classification + safe-shell +1 seeding.
+      6. Gradient-consistent Jacobi flood fill (cos_theta_min gate).
+      7. Barill hierarchical FWN on NB ∪ conflict ∪ unknown → exact sign.
+      8. Assemble phi = sign · |d|, clamp to 2·domain-diagonal.
     """
     dev = pick_device(device)
     if dev.type == "mps":
         os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
     if verbose:
-        print(f"[v2] Phase 2  device={dev}  "
+        print(f"[v2] LBVH+FWN  device={dev}  "
               f"fwn_beta={fwn_beta} band={fwn_band_width_cells} cos_theta_min={cos_theta_min}")
 
     mem_budget = 8.0 if target_memory_gb is None else float(target_memory_gb)
@@ -1165,13 +1311,58 @@ def mesh_to_sdf_torch_v2(
     if verbose:
         print(f"[flood] {time.time() - t0:.3f}s")
 
-    # ---- Stage 9 (temporary Phase 4 assembly): S ∈ {-1 → inside; else outside} ----
-    # Phase 5 will route S == 0 and S == -2 to exact Barill FWN. Until then the
-    # conservative fallback keeps the field usable on convex primitives.
+    # ---- Stage 7: gather unresolved voxels for exact FWN ----
+    query_mask = NB | (S == -2) | (S == 0)
+    n_query = int(query_mask.sum())
+    n_nb = int(NB.sum())
+    n_conflict = int((S == -2).sum())
+    n_unknown = int(((S == 0) & ~NB).sum())
+    if verbose:
+        total = U.numel()
+        print(f"[fwn query] {n_query}/{total} "
+              f"(NB={n_nb}, conflict={n_conflict}, unknown-FF={n_unknown})")
+        if n_conflict > 0.01 * total:
+            print(f"  WARN: conflict fraction {n_conflict/total*100:.2f}% > 1%")
+        if n_unknown > 0.001 * total:
+            print(f"  WARN: unknown-FF fraction {n_unknown/total*100:.3f}% > 0.1%")
+
+    # ---- Stage 8: Barill hierarchical FWN on queries ----
+    t0 = time.time()
+    if n_query > 0:
+        q_idx = query_mask.reshape(-1).nonzero(as_tuple=True)[0]
+        q_pts = Q.index_select(0, q_idx)
+        w = _lbvh_fwn_winding(bvh, q_pts, beta=fwn_beta, verbose=verbose)
+        inside_q = w.abs() > 0.5
+        if verbose:
+            mid_mass = float(((w.abs() > 0.4) & (w.abs() < 0.6)).float().mean())
+            print(f"[fwn] {time.time() - t0:.3f}s  "
+                  f"|w| range=[{float(w.abs().min()):.3f}, {float(w.abs().max()):.3f}]  "
+                  f"inside={int(inside_q.sum())}/{n_query}  "
+                  f"ambiguous (|w|∈[0.4,0.6])={mid_mass*100:.2f}%")
+            if mid_mass > 0.01:
+                print("  WARN: >1% queries have |w|∈[0.4,0.6] — mesh may not be watertight")
+
+        S_flat = S.reshape(-1)
+        sign_q = torch.where(inside_q,
+                             torch.full_like(w, -1.0),
+                             torch.full_like(w,  1.0)).to(torch.int8)
+        S_flat.scatter_(0, q_idx, sign_q)
+        S = S_flat.reshape(nx, ny, nz)
+
+    # ---- Stage 9: final assembly ----
+    # Every voxel's sign is now explicit: S == -1 inside, S == +1 outside.
     sign = torch.where(S == -1,
                        torch.full_like(U, -1.0),
                        torch.full_like(U,  1.0))
     phi = sign * U
+
+    scene_min = torch.stack([x_t.min(), y_t.min(), z_t.min()])
+    scene_max = torch.stack([x_t.max(), y_t.max(), z_t.max()])
+    diag = float(torch.linalg.norm(scene_max - scene_min))
+    max_dist = 2.0 * diag
+    phi = torch.nan_to_num(phi, nan=max_dist,
+                           posinf=max_dist, neginf=-max_dist)
+    phi = phi.clamp(-max_dist, max_dist)
 
     # dx scalar only if the grid is uniform (same as legacy).
     dx_out = float("nan")

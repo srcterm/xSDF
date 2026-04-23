@@ -315,7 +315,10 @@ def _aggregate_bottom_up(L: int,
     done[L - 1:] = True  # leaves propagate upward first
     propagated = torch.zeros(N, dtype=torch.bool, device=device)
 
-    max_iters = int(math.ceil(math.log2(max(L, 2)))) + 2
+    # Karras-tree depth is bounded by the longest common Morton prefix, which
+    # for 30-bit codes can approach 30 — not log2(L). We loop generously and
+    # rely on the early break when no nodes are activating.
+    max_iters = 64
     for _ in range(max_iters):
         activating = done & ~propagated
         src_idx = activating.nonzero(as_tuple=True)[0]
