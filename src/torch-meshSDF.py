@@ -826,6 +826,250 @@ def _lbvh_unsigned_distance(bvh: "lbvh.LBVH",
     return d_best
 
 
+def _compute_dx_local_max(x_t: torch.Tensor,
+                           y_t: torch.Tensor,
+                           z_t: torch.Tensor) -> torch.Tensor:
+    """Per-voxel max spacing across the three axes.
+
+    For each face-vertex (i,j,k) we take the larger of the forward and
+    backward spacing on each axis, then the max across axes. Feeds both the
+    narrow-band threshold and the safe-shell seed gate.
+    """
+    def _axis_max(c: torch.Tensor) -> torch.Tensor:
+        dc = c[1:] - c[:-1]                         # (n-1,)
+        fwd = torch.cat([dc, dc[-1:]])              # (n,)
+        bwd = torch.cat([dc[:1], dc])               # (n,)
+        return torch.maximum(fwd, bwd)
+
+    dx_x = _axis_max(x_t)                           # (nx,)
+    dx_y = _axis_max(y_t)                           # (ny,)
+    dx_z = _axis_max(z_t)                           # (nz,)
+
+    nx, ny, nz = dx_x.numel(), dx_y.numel(), dx_z.numel()
+    return torch.maximum(
+        torch.maximum(dx_x.view(nx, 1, 1).expand(nx, ny, nz),
+                      dx_y.view(1, ny, 1).expand(nx, ny, nz)),
+        dx_z.view(1, 1, nz).expand(nx, ny, nz),
+    ).contiguous()
+
+
+def _compute_gradient_nonuniform(U: torch.Tensor,
+                                  x_t: torch.Tensor,
+                                  y_t: torch.Tensor,
+                                  z_t: torch.Tensor) -> torch.Tensor:
+    """Central differences on a non-uniform face-vertex grid with one-sided
+    boundary stencils, then unit-normalize. Output shape (nx, ny, nz, 3).
+
+    Points where |∇U| is numerically indistinguishable from zero (e.g. a
+    perfectly flat region) get a zero gradient so the flood-fill cosine test
+    in Stage 6 simply ignores them instead of propagating random directions.
+    """
+    nx, ny, nz = U.shape
+
+    Gx = torch.empty_like(U)
+    dx_center = (x_t[2:] - x_t[:-2]).view(-1, 1, 1)
+    Gx[1:-1] = (U[2:] - U[:-2]) / dx_center
+    Gx[0]    = (U[1]  - U[0])  / (x_t[1]  - x_t[0])
+    Gx[-1]   = (U[-1] - U[-2]) / (x_t[-1] - x_t[-2])
+
+    Gy = torch.empty_like(U)
+    dy_center = (y_t[2:] - y_t[:-2]).view(1, -1, 1)
+    Gy[:, 1:-1, :] = (U[:, 2:, :] - U[:, :-2, :]) / dy_center
+    Gy[:, 0, :]    = (U[:, 1, :]  - U[:, 0, :])  / (y_t[1]  - y_t[0])
+    Gy[:, -1, :]   = (U[:, -1, :] - U[:, -2, :]) / (y_t[-1] - y_t[-2])
+
+    Gz = torch.empty_like(U)
+    dz_center = (z_t[2:] - z_t[:-2]).view(1, 1, -1)
+    Gz[:, :, 1:-1] = (U[:, :, 2:] - U[:, :, :-2]) / dz_center
+    Gz[:, :, 0]    = (U[:, :, 1]  - U[:, :, 0])  / (z_t[1]  - z_t[0])
+    Gz[:, :, -1]   = (U[:, :, -1] - U[:, :, -2]) / (z_t[-1] - z_t[-2])
+
+    G = torch.stack([Gx, Gy, Gz], dim=-1)           # (nx, ny, nz, 3)
+
+    # Unit-normalize where |G| is non-trivial; zero out flat regions.
+    max_dx = max(
+        float((x_t[1:] - x_t[:-1]).abs().max()),
+        float((y_t[1:] - y_t[:-1]).abs().max()),
+        float((z_t[1:] - z_t[:-1]).abs().max()),
+    )
+    g_norm = torch.linalg.norm(G, dim=-1)
+    safe = g_norm > (1e-8 * max_dx)
+    G = torch.where(safe.unsqueeze(-1),
+                    G / g_norm.clamp_min(1e-20).unsqueeze(-1),
+                    torch.zeros_like(G))
+    return G
+
+
+def _narrow_band_and_seed(U: torch.Tensor,
+                           dx_local_max: torch.Tensor,
+                           fwn_band_width_cells: float,
+                           verbose: bool = False):
+    """Classify voxels into narrow band vs far field; seed +1 on domain faces
+    that sit far enough from the mesh to trust as 'outside'.
+
+    Returns (NB, S, diag) where:
+        NB   : (nx, ny, nz) bool — points needing exact FWN signing
+        S    : (nx, ny, nz) int8 — 0 unknown, +1 outside-seed (Phase 3 only seeds +1)
+        diag : dict of per-stage diagnostics (band fraction, seed fractions)
+    """
+    nx, ny, nz = U.shape
+    dev = U.device
+
+    tau_sign = float(fwn_band_width_cells) * dx_local_max
+    NB = U < tau_sign
+
+    # Six-face shell mask (one voxel thick).
+    is_boundary = torch.zeros_like(U, dtype=torch.bool)
+    is_boundary[0, :, :]  = True
+    is_boundary[-1, :, :] = True
+    is_boundary[:, 0, :]  = True
+    is_boundary[:, -1, :] = True
+    is_boundary[:, :, 0]  = True
+    is_boundary[:, :, -1] = True
+
+    # Seed voxels only where U is clearly far from the mesh (avoids Ahmed's
+    # wheel-floor case where a z=0 voxel is inside the tire tread).
+    safe = U > 2.0 * dx_local_max
+    S = torch.zeros_like(U, dtype=torch.int8)
+    S[is_boundary & safe] = 1
+
+    n_total = U.numel()
+    nb_frac = float(NB.sum()) / n_total
+    n_boundary = int(is_boundary.sum())
+    n_seed = int((is_boundary & safe).sum())
+    seed_frac = n_seed / max(n_boundary, 1)
+
+    # Per-face safe-seed coverage (Ahmed: z-min face grazes the wheels).
+    face_masks = {
+        "x-": is_boundary.new_zeros(U.shape, dtype=torch.bool),
+        "x+": is_boundary.new_zeros(U.shape, dtype=torch.bool),
+        "y-": is_boundary.new_zeros(U.shape, dtype=torch.bool),
+        "y+": is_boundary.new_zeros(U.shape, dtype=torch.bool),
+        "z-": is_boundary.new_zeros(U.shape, dtype=torch.bool),
+        "z+": is_boundary.new_zeros(U.shape, dtype=torch.bool),
+    }
+    face_masks["x-"][0, :, :]  = True
+    face_masks["x+"][-1, :, :] = True
+    face_masks["y-"][:, 0, :]  = True
+    face_masks["y+"][:, -1, :] = True
+    face_masks["z-"][:, :, 0]  = True
+    face_masks["z+"][:, :, -1] = True
+
+    face_stats = {}
+    for face, mask in face_masks.items():
+        n_f = int(mask.sum())
+        n_s = int((mask & safe).sum())
+        face_stats[face] = n_s / max(n_f, 1)
+
+    diag = {
+        "narrow_band_fraction": nb_frac,
+        "safe_seed_fraction": seed_frac,
+        "face_safe_fraction": face_stats,
+    }
+
+    if verbose:
+        print(f"[nb/seed] |NB|/N = {nb_frac*100:.2f}%  "
+              f"(expect < 10% on well-padded domains)")
+        print(f"[nb/seed] safe-shell +1 seeds: {n_seed}/{n_boundary} "
+              f"= {seed_frac*100:.2f}%")
+        zm = face_stats["z-"]
+        if zm < 0.5:
+            print(f"[nb/seed] WARNING: z-min face only {zm*100:.1f}% safe — "
+                  f"geometry grazes the floor; Stage 8 FWN will cover it")
+        if nb_frac > 0.10:
+            print(f"[nb/seed] WARNING: narrow-band fraction {nb_frac*100:.2f}% "
+                  f"is high; consider widening domain or reducing band cells")
+
+    return NB, S, diag
+
+
+def _flood_fill_gradient_consistent(S: torch.Tensor,
+                                      G: torch.Tensor,
+                                      FF: torch.Tensor,
+                                      cos_theta_min: float,
+                                      max_iters: int,
+                                      verbose: bool = False) -> torch.Tensor:
+    """Jacobi flood fill gated by gradient alignment.
+
+    For every still-unknown voxel in the far field, a face-neighbor's sign
+    only votes when ⟨G_v, G_n⟩ > cos_theta_min and the neighbor itself
+    already carries a committed sign (±1, not 0 and not the conflict marker).
+
+    Resolution per iteration for a voxel v with S[v] == 0 and FF[v] True:
+        pos > 0, neg == 0  →  +1
+        neg > 0, pos == 0  →  −1
+        pos > 0, neg > 0   →  −2   (conflict; Phase 5 routes to exact FWN)
+        otherwise          →   0   (try again next iteration)
+
+    Implementation: slice-based 6-neighbor gather (no fancy indexing) so MPS
+    stays on the fast path. Only scalar sync per iter is the ``num_changed``
+    reduction used for early termination.
+    """
+    nx, ny, nz = S.shape
+    dev = S.device
+
+    # Dict of 6 (name, center_slice, neighbor_slice) pairs so the 6 shifts
+    # share one loop body.
+    Sc = slice(None)
+    shifts = (
+        ("+x", (slice(0, nx - 1), Sc, Sc), (slice(1, nx),     Sc, Sc)),
+        ("-x", (slice(1, nx),     Sc, Sc), (slice(0, nx - 1), Sc, Sc)),
+        ("+y", (Sc, slice(0, ny - 1), Sc), (Sc, slice(1, ny),     Sc)),
+        ("-y", (Sc, slice(1, ny),     Sc), (Sc, slice(0, ny - 1), Sc)),
+        ("+z", (Sc, Sc, slice(0, nz - 1)), (Sc, Sc, slice(1, nz))),
+        ("-z", (Sc, Sc, slice(1, nz)),     (Sc, Sc, slice(0, nz - 1))),
+    )
+
+    int8_pos = torch.tensor( 1, dtype=torch.int8, device=dev)
+    int8_neg = torch.tensor(-1, dtype=torch.int8, device=dev)
+    int8_cfl = torch.tensor(-2, dtype=torch.int8, device=dev)
+
+    total_changed = 0
+    converged_iter = None
+    for it in range(max_iters):
+        pos_vote = torch.zeros((nx, ny, nz), dtype=torch.int32, device=dev)
+        neg_vote = torch.zeros((nx, ny, nz), dtype=torch.int32, device=dev)
+
+        for _name, cs, ns in shifts:
+            G_c = G[cs + (Sc,)]
+            G_n = G[ns + (Sc,)]
+            cos_t = (G_c * G_n).sum(dim=-1)
+            S_n = S[ns]
+            signed_neighbor = (S_n == 1) | (S_n == -1)
+            accept = (cos_t > cos_theta_min) & signed_neighbor
+            pos_vote[cs] += (accept & (S_n == 1)).to(torch.int32)
+            neg_vote[cs] += (accept & (S_n == -1)).to(torch.int32)
+
+        unknown = (S == 0) & FF
+        has_pos = pos_vote > 0
+        has_neg = neg_vote > 0
+        assign_pos      = unknown & has_pos & ~has_neg
+        assign_neg      = unknown & has_neg & ~has_pos
+        assign_conflict = unknown & has_pos &  has_neg
+
+        S = S.masked_fill(assign_pos,      int8_pos)
+        S = S.masked_fill(assign_neg,      int8_neg)
+        S = S.masked_fill(assign_conflict, int8_cfl)
+
+        changed = assign_pos | assign_neg | assign_conflict
+        num_changed = int(changed.sum())
+        total_changed += num_changed
+        if num_changed == 0:
+            converged_iter = it
+            break
+
+    if verbose:
+        n_pos = int((S ==  1).sum())
+        n_neg = int((S == -1).sum())
+        n_cfl = int((S == -2).sum())
+        n_unk = int((S ==  0).sum())
+        print(f"[flood] {converged_iter if converged_iter is not None else max_iters} iters, "
+              f"{total_changed} voxels updated; "
+              f"+1={n_pos} −1={n_neg} conflict={n_cfl} unknown={n_unk}")
+
+    return S
+
+
 def mesh_to_sdf_torch_v2(
     V_np,
     F_np,
@@ -890,8 +1134,44 @@ def mesh_to_sdf_torch_v2(
         print(f"[traversal] {time.time() - t0:.3f}s  "
               f"|d| range=[{float(d_best.min()):.4f}, {float(d_best.max()):.4f}]")
 
-    # ---- Placeholder phi = U (unsigned). Sign is Phase 3–5. ----
-    phi = d_best.reshape(nx, ny, nz)
+    U = d_best.reshape(nx, ny, nz)
+
+    # ---- Stage 3: gradient on non-uniform grid (unit-normalized) ----
+    t0 = time.time()
+    G = _compute_gradient_nonuniform(U, x_t, y_t, z_t)
+    if verbose:
+        gmag = torch.linalg.norm(G, dim=-1)
+        nz_mask = gmag > 0
+        mean_mag = float(gmag[nz_mask].mean()) if bool(nz_mask.any()) else 0.0
+        print(f"[gradient] {time.time() - t0:.3f}s  "
+              f"mean|G|={mean_mag:.4f} (≈1 is eikonal), "
+              f"zeroed={int((~nz_mask).sum())}/{U.numel()}")
+
+    # ---- Stages 4 + 5: narrow band + safe-shell seed ----
+    t0 = time.time()
+    dx_local_max = _compute_dx_local_max(x_t, y_t, z_t)
+    NB, S, diag = _narrow_band_and_seed(
+        U, dx_local_max, fwn_band_width_cells, verbose=verbose)
+    if verbose:
+        print(f"[nb/seed] {time.time() - t0:.3f}s")
+
+    # ---- Stage 6: gradient-consistent flood fill (Jacobi) ----
+    t0 = time.time()
+    FF = ~NB
+    max_flood_iters = 3 * max(nx, ny, nz)
+    S = _flood_fill_gradient_consistent(
+        S, G, FF, cos_theta_min=cos_theta_min,
+        max_iters=max_flood_iters, verbose=verbose)
+    if verbose:
+        print(f"[flood] {time.time() - t0:.3f}s")
+
+    # ---- Stage 9 (temporary Phase 4 assembly): S ∈ {-1 → inside; else outside} ----
+    # Phase 5 will route S == 0 and S == -2 to exact Barill FWN. Until then the
+    # conservative fallback keeps the field usable on convex primitives.
+    sign = torch.where(S == -1,
+                       torch.full_like(U, -1.0),
+                       torch.full_like(U,  1.0))
+    phi = sign * U
 
     # dx scalar only if the grid is uniform (same as legacy).
     dx_out = float("nan")
