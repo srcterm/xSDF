@@ -612,10 +612,7 @@ def mesh_to_sdf_torch(
 
 
 # ============================================================================
-# Phase 2: LBVH full-grid unsigned distance (|d|) with cdist warm-start.
-# Stage 2 of the final pipeline; signing (flood fill + Barill FWN) is added in
-# Phases 3–5. During Phase 2, mesh_to_sdf_torch_v2 returns U (unsigned |d|) as
-# the phi field so the integration path stays runnable end-to-end.
+# LBVH full-grid unsigned distance (|d|) + greedy-leaf warm-start + BFS.
 # ============================================================================
 
 def _pairwise_point_triangle_dist(P: torch.Tensor,
@@ -684,144 +681,293 @@ def _pairwise_point_triangle_dist(P: torch.Tensor,
     return d
 
 
-def _cdist_warmstart(Q: torch.Tensor,
-                     V: torch.Tensor,
-                     target_memory_gb: float,
-                     verbose: bool = False) -> torch.Tensor:
-    """Tiled point-to-vertex min distance as a tight initial upper bound.
+def _greedy_leaf_warmstart(bvh: "lbvh.LBVH",
+                           Q: torch.Tensor,
+                           verbose: bool = False) -> torch.Tensor:
+    """Tight d_best upper bound via greedy BVH descent to one leaf per query.
 
-    Plan default: QB=4096, VB=32768 costing ≈ 0.5 GB scratch at 8 GB budget.
-    Shrinks tiles if the backend OOMs — MPS in particular can fail on a single
-    large cdist even if we've budgeted for it.
-    """
-    Nq = Q.shape[0]
-    Nv = V.shape[0]
-    dev = Q.device
+    For each query, walk root→leaf picking the child whose AABB is closer.
+    At the terminating leaf, evaluate distance to its 1..leaf_size triangles.
+    O(Nq · log L) ops on fixed-size tensors — no dynamic reshapes, no host
+    syncs in the hot loop — gives BFS a tight enough bound to prune
+    aggressively from level 0.
 
-    scratch_bytes = max(0.5, target_memory_gb * 0.0625) * (1024 ** 3)
-    VB = min(Nv, 32768)
-    QB = max(128, min(Nq, int(scratch_bytes / max(VB * 4, 1))))
-    QB = min(QB, 4096)
-
-    d_best = torch.full((Nq,), float("inf"), dtype=torch.float32, device=dev)
-
-    q0 = 0
-    while q0 < Nq:
-        q1 = min(q0 + QB, Nq)
-        pts = Q[q0:q1]
-        block_min: Optional[torch.Tensor] = None
-        v0 = 0
-        while v0 < Nv:
-            v1 = min(v0 + VB, Nv)
-            try:
-                d_block = torch.cdist(pts, V[v0:v1])            # (qb, vb)
-                m = d_block.min(dim=1).values
-            except RuntimeError as exc:
-                # Shrink VB on OOM, retry this tile.
-                if VB > 2048:
-                    VB = max(2048, VB // 2)
-                    if verbose:
-                        print(f"[cdist] OOM; shrunk VB → {VB}")
-                    continue
-                raise
-            block_min = m if block_min is None else torch.minimum(block_min, m)
-            v0 = v1
-        d_best[q0:q1] = block_min  # type: ignore[arg-type]
-        q0 = q1
-    return d_best
-
-
-def _lbvh_unsigned_distance(bvh: "lbvh.LBVH",
-                            Q: torch.Tensor,
-                            d_best: torch.Tensor,
-                            verbose: bool = False) -> torch.Tensor:
-    """Stackless LBVH traversal producing unsigned distance.
-
-    Every iteration: gather (cur_node → AABB), prune by d_lo > d_best, process
-    leaves against their 1..leaf_size triangles, advance left or skip. Active
-    set is compacted every 32 iterations to shed finished queries.
+    Bound is ≥ true nearest-surface distance (single-leaf greedy walk may
+    miss the truly-closest leaf); the subsequent full BFS tightens it
+    exactly.
     """
     dev = Q.device
     Nq = Q.shape[0]
+    if Nq == 0:
+        return torch.zeros(0, dtype=torch.float32, device=dev)
+
     L = bvh.num_leaves
     leaf_threshold = L - 1
     leaf_size = bvh.leaf_size
     Nt = bvh.F.shape[0]
-
-    cur_node = torch.zeros(Nq, dtype=torch.int32, device=dev)  # root for everyone
-    active = torch.arange(Nq, dtype=torch.long, device=dev)
 
     V = bvh.V
     F = bvh.F
     aabb_min = bvh.aabb_min
     aabb_max = bvh.aabb_max
     left = bvh.left
-    skip = bvh.skip
+    right = bvh.right
     tri_order = bvh.tri_order.to(torch.long) if bvh.tri_order.dtype != torch.long else bvh.tri_order
     leaf_beg = bvh.leaf_tri_beg.to(torch.long)
     leaf_end = bvh.leaf_tri_end.to(torch.long)
 
-    max_iters = 4 * bvh.num_nodes + 64
-    neg_one = torch.full((1,), -1, dtype=torch.int32, device=dev)
+    cur_n = torch.zeros(Nq, dtype=torch.int32, device=dev)
+    max_descent = 64  # Karras tree depth ≤ 30 for 30-bit Morton; slack
 
-    for it in range(max_iters):
-        if active.numel() == 0:
-            if verbose:
-                print(f"[lbvh traversal] converged after {it} iters")
+    for _ in range(max_descent):
+        is_leaf = cur_n >= leaf_threshold
+        n_long = cur_n.clamp_min(0).to(torch.long)
+        lc = left.index_select(0, n_long)
+        rc = right.index_select(0, n_long)
+        lc_safe = lc.clamp_min(0).to(torch.long)
+        rc_safe = rc.clamp_min(0).to(torch.long)
+
+        l_min = aabb_min.index_select(0, lc_safe)
+        l_max = aabb_max.index_select(0, lc_safe)
+        r_min = aabb_min.index_select(0, rc_safe)
+        r_max = aabb_max.index_select(0, rc_safe)
+
+        l_clamped = torch.minimum(torch.maximum(Q, l_min), l_max)
+        r_clamped = torch.minimum(torch.maximum(Q, r_min), r_max)
+        d_left = torch.linalg.norm(Q - l_clamped, dim=-1)
+        d_right = torch.linalg.norm(Q - r_clamped, dim=-1)
+
+        closer_is_left = d_left <= d_right
+        next_n = torch.where(closer_is_left, lc, rc)
+        cur_n = torch.where(is_leaf, cur_n, next_n)
+
+    # Evaluate triangles at each query's terminating leaf.
+    leaf_k = (cur_n - leaf_threshold).clamp_min(0).to(torch.long)
+    beg = leaf_beg.index_select(0, leaf_k)
+    end = leaf_end.index_select(0, leaf_k)
+    d_best = torch.full((Nq,), float("inf"), dtype=torch.float32, device=dev)
+
+    for off in range(leaf_size):
+        tri_pos = beg + off
+        has_tri = tri_pos < end
+        tri_pos_safe = tri_pos.clamp_max(Nt - 1)
+        tri_orig = tri_order.index_select(0, tri_pos_safe)
+        f = F.index_select(0, tri_orig)
+        A = V.index_select(0, f[:, 0])
+        B = V.index_select(0, f[:, 1])
+        C = V.index_select(0, f[:, 2])
+        d_tri = _pairwise_point_triangle_dist(Q, A, B, C)
+        d_tri = torch.where(has_tri, d_tri, torch.full_like(d_tri, float("inf")))
+        d_best = torch.minimum(d_best, d_tri)
+
+    if verbose:
+        print(f"[warmstart] greedy-leaf descent  d_best range=["
+              f"{float(d_best.min()):.4f}, {float(d_best.max()):.4f}]")
+    return d_best
+
+
+# Empirical MPS safe cap for int32 worklist tensors. Above ~20M entries
+# (~80 MB) MPS silently corrupts large index_select / cat results, which
+# manifests as runaway BFS depth (47 vs the tree's true 30) and ambiguous
+# winding numbers. CPU/CUDA pass Nq through unchanged so monolithic BFS
+# avoids per-chunk dispatch overhead.
+_MPS_CHUNK_THRESH = 16_000_000
+
+
+def _resolve_chunk_thresh(dev: torch.device, Nq: int, override: Optional[int]) -> int:
+    if override is not None:
+        return override
+    if dev.type == "mps":
+        return _MPS_CHUNK_THRESH
+    return max(Nq, 1)
+
+
+def _merge_chunks(chunks, thresh: int):
+    """Pack a list of (wl_q, wl_n) chunks back together to reduce dispatch.
+
+    Fast path: when the total fits under ``thresh`` (typical of the BFS's
+    shrinking tail), concat everything into a single chunk so subsequent
+    iterations launch one set of kernels instead of N. Otherwise pack
+    adjacent chunks greedily while their union still fits.
+    """
+    if len(chunks) <= 1:
+        return chunks
+    total = sum(c[0].numel() for c in chunks)
+    if total <= thresh:
+        return [(torch.cat([c[0] for c in chunks]),
+                 torch.cat([c[1] for c in chunks]))]
+    packed = []
+    cur_q, cur_n, cur_size = None, None, 0
+    for q, n in chunks:
+        sz = q.numel()
+        if cur_q is None:
+            cur_q, cur_n, cur_size = q, n, sz
+        elif cur_size + sz <= thresh:
+            cur_q = torch.cat([cur_q, q])
+            cur_n = torch.cat([cur_n, n])
+            cur_size += sz
+        else:
+            packed.append((cur_q, cur_n))
+            cur_q, cur_n, cur_size = q, n, sz
+    if cur_q is not None:
+        packed.append((cur_q, cur_n))
+    return packed
+
+
+def _lbvh_unsigned_distance(bvh: "lbvh.LBVH",
+                            Q: torch.Tensor,
+                            d_best: torch.Tensor,
+                            verbose: bool = False,
+                            chunk_thresh: Optional[int] = None) -> torch.Tensor:
+    """Batched BFS LBVH traversal producing unsigned distance.
+
+    Replaces the per-query state machine with a worklist of (query, node)
+    pairs that expands level-by-level. Each BFS iteration is one pass over
+    the whole worklist, so total kernel launches scale with tree depth
+    (~log₂ L, ≤30 for 30-bit Morton) instead of per-query path length
+    (thousands).
+
+    The worklist is held as a list of chunks, each capped at ``chunk_thresh``
+    int32 entries. MPS silently corrupts ``index_select``/``cat`` results
+    above ~80 MB, which previously inflated BFS depth from 30 to 47 and
+    polluted FWN; chunking guarantees individual tensors stay under that
+    threshold. After every depth iter, chunks whose union still fits under
+    the cap are merged so the dispatch tax only applies during the worklist
+    peak, not on the shrinking tail.
+
+    Caller must seed ``d_best`` with a tight upper bound — without it, early
+    BFS levels can't prune and the worklist blows up.
+    """
+    dev = Q.device
+    Nq = Q.shape[0]
+    if Nq == 0:
+        return d_best
+    L = bvh.num_leaves
+    leaf_threshold = L - 1
+    leaf_size = bvh.leaf_size
+    Nt = bvh.F.shape[0]
+
+    V = bvh.V
+    F = bvh.F
+    aabb_min = bvh.aabb_min
+    aabb_max = bvh.aabb_max
+    left = bvh.left
+    right = bvh.right
+    tri_order = bvh.tri_order.to(torch.long) if bvh.tri_order.dtype != torch.long else bvh.tri_order
+    leaf_beg = bvh.leaf_tri_beg.to(torch.long)
+    leaf_end = bvh.leaf_tri_end.to(torch.long)
+
+    thresh = _resolve_chunk_thresh(dev, Nq, chunk_thresh)
+    max_depth = 64      # 30-bit Morton caps depth at 30; slack for safety
+
+    # Initial worklist: split Q into chunks of ≤ thresh, each rooted at node 0.
+    chunks = []
+    q_off = 0
+    while q_off < Nq:
+        qe = min(q_off + thresh, Nq)
+        chunks.append((
+            torch.arange(q_off, qe, dtype=torch.int32, device=dev),
+            torch.zeros(qe - q_off, dtype=torch.int32, device=dev),
+        ))
+        q_off = qe
+
+    peak_worklist = 0
+    peak_chunks = 0
+    max_depth_reached = 0
+
+    for depth in range(max_depth):
+        new_chunks = []
+        P_total = 0
+        for wl_q, wl_n in chunks:
+            P = wl_q.numel()
+            if P == 0:
+                continue
+            P_total += P
+
+            q_long = wl_q.to(torch.long)
+            n_long = wl_n.to(torch.long)
+
+            p = Q.index_select(0, q_long)
+            nm = aabb_min.index_select(0, n_long)
+            nM = aabb_max.index_select(0, n_long)
+            clamped = torch.minimum(torch.maximum(p, nm), nM)
+            d_lo = torch.linalg.norm(p - clamped, dim=-1)
+
+            best_pair = d_best.index_select(0, q_long)
+            live = d_lo < best_pair
+            is_leaf = wl_n >= leaf_threshold
+
+            # ---- Leaf pairs: evaluate triangles, scatter_reduce amin ----
+            # No bool().any() guard: empty branches become cheap no-ops,
+            # avoiding a host-device sync on MPS each iteration.
+            leaf_mask = live & is_leaf
+            sub_leaf = leaf_mask.nonzero(as_tuple=True)[0]
+            if sub_leaf.numel() > 0:
+                leaf_q_long = q_long.index_select(0, sub_leaf)
+                leaf_k = (wl_n.index_select(0, sub_leaf) - leaf_threshold).to(torch.long)
+                beg = leaf_beg.index_select(0, leaf_k)
+                end = leaf_end.index_select(0, leaf_k)
+                pts = p.index_select(0, sub_leaf)
+                best_upd = best_pair.index_select(0, sub_leaf)
+
+                # Always run all leaf_size offsets; has_tri gates per-pair.
+                for off in range(leaf_size):
+                    tri_pos = beg + off
+                    has_tri = tri_pos < end
+                    tri_pos_safe = tri_pos.clamp_max(Nt - 1)
+                    tri_orig = tri_order.index_select(0, tri_pos_safe)
+                    f = F.index_select(0, tri_orig)
+                    A = V.index_select(0, f[:, 0])
+                    B = V.index_select(0, f[:, 1])
+                    C = V.index_select(0, f[:, 2])
+                    d_tri = _pairwise_point_triangle_dist(pts, A, B, C)
+                    d_tri = torch.where(has_tri, d_tri, torch.full_like(d_tri, float("inf")))
+                    best_upd = torch.minimum(best_upd, d_tri)
+
+                lbvh._scatter_amin(d_best, leaf_q_long, best_upd)
+
+            # ---- Expand live internal pairs to (left, right) children ----
+            expand = live & ~is_leaf
+            sub_int = expand.nonzero(as_tuple=True)[0]
+            M = sub_int.numel()
+            if M == 0:
+                continue
+            q_int = wl_q.index_select(0, sub_int)
+            n_int_long = n_long.index_select(0, sub_int)
+            left_c = left.index_select(0, n_int_long).to(torch.int32)
+            right_c = right.index_select(0, n_int_long).to(torch.int32)
+
+            if 2 * M <= thresh:
+                new_q = torch.empty(2 * M, dtype=torch.int32, device=dev)
+                new_q[:M] = q_int; new_q[M:] = q_int
+                new_n = torch.empty(2 * M, dtype=torch.int32, device=dev)
+                new_n[:M] = left_c; new_n[M:] = right_c
+                new_chunks.append((new_q, new_n))
+            else:
+                # Split each side at thresh-sized boundaries so no single
+                # tensor crosses the MPS corruption cap. Adjacent halves get
+                # repacked by _merge_chunks if they later fit together.
+                for half_q, half_n in ((q_int, left_c), (q_int, right_c)):
+                    off = 0
+                    while off < M:
+                        end = min(off + thresh, M)
+                        new_chunks.append((half_q[off:end].clone(),
+                                           half_n[off:end].clone()))
+                        off = end
+
+        new_chunks = _merge_chunks(new_chunks, thresh)
+        if P_total > peak_worklist:
+            peak_worklist = P_total
+        if len(new_chunks) > peak_chunks:
+            peak_chunks = len(new_chunks)
+        chunks = new_chunks
+        if not chunks:
             break
+        max_depth_reached = depth + 1
 
-        n = cur_node.index_select(0, active)                  # (A,) int32
-        valid = n != -1
-        n_safe = n.clamp_min(0).to(torch.long)
-
-        p = Q.index_select(0, active)
-        nm = aabb_min.index_select(0, n_safe)
-        nM = aabb_max.index_select(0, n_safe)
-        clamped = torch.minimum(torch.maximum(p, nm), nM)
-        d_lo = torch.linalg.norm(p - clamped, dim=-1)
-
-        best_cur = d_best.index_select(0, active)
-        pruned = d_lo >= best_cur
-        is_leaf = n >= leaf_threshold
-
-        process_leaf = is_leaf & ~pruned & valid
-        if bool(process_leaf.any()):
-            sub = process_leaf.nonzero(as_tuple=True)[0]      # (Nl,)
-            glob = active.index_select(0, sub)
-            leaf_k = (n.index_select(0, sub) - leaf_threshold).to(torch.long)
-            beg = leaf_beg.index_select(0, leaf_k)
-            end = leaf_end.index_select(0, leaf_k)
-            pts = p.index_select(0, sub)
-            best_upd = best_cur.index_select(0, sub)
-
-            for off in range(leaf_size):
-                tri_pos = beg + off
-                has_tri = tri_pos < end
-                if not bool(has_tri.any()):
-                    break
-                tri_pos_safe = tri_pos.clamp_max(Nt - 1)
-                tri_orig = tri_order.index_select(0, tri_pos_safe)
-                f = F.index_select(0, tri_orig)
-                A = V.index_select(0, f[:, 0])
-                B = V.index_select(0, f[:, 1])
-                C = V.index_select(0, f[:, 2])
-                d_tri = _pairwise_point_triangle_dist(pts, A, B, C)
-                d_tri = torch.where(has_tri, d_tri, torch.full_like(d_tri, float("inf")))
-                best_upd = torch.minimum(best_upd, d_tri)
-
-            d_best.scatter_(0, glob, best_upd)
-
-        advance = is_leaf | pruned
-        left_n = left.index_select(0, n_safe)
-        skip_n = skip.index_select(0, n_safe)
-        nxt = torch.where(advance, skip_n, left_n)
-        nxt = torch.where(valid, nxt, neg_one.expand_as(nxt))
-        cur_node.scatter_(0, active, nxt)
-
-        if (it & 31) == 31:
-            alive_mask = cur_node.index_select(0, active) != -1
-            if not bool(alive_mask.all()):
-                active = active[alive_mask]
+    if verbose:
+        print(f"[lbvh bfs] max depth={max_depth_reached}  peak worklist={peak_worklist}  "
+              f"peak chunks={peak_chunks}  thresh={thresh}")
 
     return d_best
 
@@ -836,20 +982,23 @@ _INV_4PI = 1.0 / (4.0 * math.pi)
 def _lbvh_fwn_winding(bvh: "lbvh.LBVH",
                       Q: torch.Tensor,
                       beta: float = 2.0,
-                      verbose: bool = False) -> torch.Tensor:
-    """Stackless LBVH traversal producing the generalized winding number w(p).
+                      verbose: bool = False,
+                      chunk_thresh: Optional[int] = None) -> torch.Tensor:
+    """Batched BFS LBVH traversal producing the generalized winding number w(p).
 
-    At every step, for each active query's current node n:
-      - leaf   → evaluate exact Van Oosterom–Strackee solid angle on the
-                 leaf's 1..leaf_size triangles, advance via skip[n].
+    At every BFS level, for each live (query, node) pair:
+      - leaf   → exact Van Oosterom–Strackee solid angle on its 1..leaf_size
+                 triangles (scatter_add into w_accum).
       - internal, admissible (||p − c_node|| > β · r_ball[n])
-               → accept the dipole Δw = (1/4π) · n_area · (c_node − p) / r³,
-                 advance via skip[n].
-      - internal, not admissible → descend via left[n].
+               → accept dipole Δw = (1/4π) · n_area · (c_node − p) / r³; done.
+      - internal, not admissible → expand to (left, right) children.
 
-    Admissibility uses c_node = c_area / area_w (precomputed-on-demand) and
-    the tight per-axis-max r_ball set by the LBVH builder. Mirrors the Phase 2
-    driver: active-set compaction every 32 iters keeps the kernel shape tight.
+    Admissibility uses c_node = c_area / area_w and the tight per-axis-max
+    r_ball set by the LBVH builder. Kernel launches scale with tree depth,
+    not per-query path length — the key property for MPS/CUDA. Worklist
+    chunking + merge mirrors ``_lbvh_unsigned_distance``: each chunk stays
+    under the MPS corruption cap, but they're repacked once the worklist
+    shrinks below threshold so the dispatch tax is bounded.
     """
     dev = Q.device
     Nq = Q.shape[0]
@@ -863,13 +1012,11 @@ def _lbvh_fwn_winding(bvh: "lbvh.LBVH",
     assert bvh.area_w is not None, "LBVH must carry dipole fields for FWN"
 
     w_accum = torch.zeros(Nq, dtype=torch.float32, device=dev)
-    cur_node = torch.zeros(Nq, dtype=torch.int32, device=dev)
-    active = torch.arange(Nq, dtype=torch.long, device=dev)
 
     V = bvh.V
     F = bvh.F
     left = bvh.left
-    skip = bvh.skip
+    right = bvh.right
     area_w = bvh.area_w
     c_area = bvh.c_area
     n_area = bvh.n_area
@@ -878,90 +1025,130 @@ def _lbvh_fwn_winding(bvh: "lbvh.LBVH",
     leaf_beg = bvh.leaf_tri_beg.to(torch.long)
     leaf_end = bvh.leaf_tri_end.to(torch.long)
 
-    max_iters = 4 * bvh.num_nodes + 64
-    neg_one = torch.full((1,), -1, dtype=torch.int32, device=dev)
+    thresh = _resolve_chunk_thresh(dev, Nq, chunk_thresh)
+    max_depth = 64
     eps_denom = 1e-20
 
-    for it in range(max_iters):
-        if active.numel() == 0:
-            if verbose:
-                print(f"[fwn traversal] converged after {it} iters")
+    chunks = []
+    q_off = 0
+    while q_off < Nq:
+        qe = min(q_off + thresh, Nq)
+        chunks.append((
+            torch.arange(q_off, qe, dtype=torch.int32, device=dev),
+            torch.zeros(qe - q_off, dtype=torch.int32, device=dev),
+        ))
+        q_off = qe
+
+    peak_worklist = 0
+    peak_chunks = 0
+    max_depth_reached = 0
+
+    for depth in range(max_depth):
+        new_chunks = []
+        P_total = 0
+        for wl_q, wl_n in chunks:
+            P = wl_q.numel()
+            if P == 0:
+                continue
+            P_total += P
+
+            q_long = wl_q.to(torch.long)
+            n_long = wl_n.to(torch.long)
+            p = Q.index_select(0, q_long)                     # (P, 3)
+
+            is_leaf = wl_n >= leaf_threshold
+
+            # ---- Admissibility for internal nodes ----
+            aw = area_w.index_select(0, n_long).clamp_min(1e-30)
+            c_node = c_area.index_select(0, n_long) / aw.unsqueeze(1)
+            diff = c_node - p                                 # (P, 3)
+            r2 = (diff * diff).sum(dim=-1)
+            r = torch.sqrt(r2.clamp_min(eps_denom))
+            rball_n = r_ball.index_select(0, n_long)
+            admissible = (r > beta * rball_n) & ~is_leaf
+
+            # ---- Accept dipole for admissibles ----
+            sub_adm = admissible.nonzero(as_tuple=True)[0]
+            if sub_adm.numel() > 0:
+                q_sub_long = q_long.index_select(0, sub_adm)
+                n_a = n_area.index_select(0, n_long.index_select(0, sub_adm))
+                d_a = diff.index_select(0, sub_adm)
+                r3 = r.index_select(0, sub_adm).pow(3).clamp_min(eps_denom)
+                dw = (n_a * d_a).sum(dim=-1) * (_INV_4PI / r3)
+                w_accum.scatter_add_(0, q_sub_long, dw)
+
+            # ---- Leaf: exact VOS per triangle ----
+            sub_leaf = is_leaf.nonzero(as_tuple=True)[0]
+            if sub_leaf.numel() > 0:
+                q_sub_long = q_long.index_select(0, sub_leaf)
+                leaf_k = (wl_n.index_select(0, sub_leaf) - leaf_threshold).to(torch.long)
+                beg = leaf_beg.index_select(0, leaf_k)
+                end = leaf_end.index_select(0, leaf_k)
+                pts = p.index_select(0, sub_leaf)
+                omega_sum = torch.zeros(pts.shape[0], dtype=torch.float32, device=dev)
+
+                for off in range(leaf_size):
+                    tri_pos = beg + off
+                    has_tri = tri_pos < end
+                    tri_pos_safe = tri_pos.clamp_max(Nt - 1)
+                    tri_orig = tri_order.index_select(0, tri_pos_safe)
+                    f = F.index_select(0, tri_orig)
+                    A = V.index_select(0, f[:, 0]) - pts
+                    B = V.index_select(0, f[:, 1]) - pts
+                    C = V.index_select(0, f[:, 2]) - pts
+                    a_len = torch.linalg.norm(A, dim=-1)
+                    b_len = torch.linalg.norm(B, dim=-1)
+                    c_len = torch.linalg.norm(C, dim=-1)
+                    num = (A * torch.linalg.cross(B, C, dim=-1)).sum(dim=-1)
+                    ab = (A * B).sum(dim=-1)
+                    bc = (B * C).sum(dim=-1)
+                    ca = (C * A).sum(dim=-1)
+                    denom = a_len * b_len * c_len + ab * c_len + bc * a_len + ca * b_len + eps_denom
+                    omega_tri = 2.0 * torch.atan2(num, denom)
+                    omega_tri = torch.where(has_tri, omega_tri, torch.zeros_like(omega_tri))
+                    omega_sum = omega_sum + omega_tri
+
+                w_accum.scatter_add_(0, q_sub_long, omega_sum * _INV_4PI)
+
+            # ---- Expand non-admissible internals ----
+            expand = ~admissible & ~is_leaf
+            sub_int = expand.nonzero(as_tuple=True)[0]
+            M = sub_int.numel()
+            if M == 0:
+                continue
+            q_int = wl_q.index_select(0, sub_int)
+            n_int_long = n_long.index_select(0, sub_int)
+            left_c = left.index_select(0, n_int_long).to(torch.int32)
+            right_c = right.index_select(0, n_int_long).to(torch.int32)
+
+            if 2 * M <= thresh:
+                new_q = torch.empty(2 * M, dtype=torch.int32, device=dev)
+                new_q[:M] = q_int; new_q[M:] = q_int
+                new_n = torch.empty(2 * M, dtype=torch.int32, device=dev)
+                new_n[:M] = left_c; new_n[M:] = right_c
+                new_chunks.append((new_q, new_n))
+            else:
+                for half_q, half_n in ((q_int, left_c), (q_int, right_c)):
+                    off = 0
+                    while off < M:
+                        end = min(off + thresh, M)
+                        new_chunks.append((half_q[off:end].clone(),
+                                           half_n[off:end].clone()))
+                        off = end
+
+        new_chunks = _merge_chunks(new_chunks, thresh)
+        if P_total > peak_worklist:
+            peak_worklist = P_total
+        if len(new_chunks) > peak_chunks:
+            peak_chunks = len(new_chunks)
+        chunks = new_chunks
+        if not chunks:
             break
+        max_depth_reached = depth + 1
 
-        n = cur_node.index_select(0, active)                  # (A,) int32
-        valid = n != -1
-        n_safe = n.clamp_min(0).to(torch.long)
-        p = Q.index_select(0, active)                         # (A, 3)
-
-        is_leaf = n >= leaf_threshold
-        is_internal = (~is_leaf) & valid
-
-        # ---- Internal node: admissibility vs descend ----
-        aw = area_w.index_select(0, n_safe).clamp_min(1e-30)
-        c_node = c_area.index_select(0, n_safe) / aw.unsqueeze(1)
-        diff = c_node - p                                     # (A, 3)
-        r2 = (diff * diff).sum(dim=-1)
-        r = torch.sqrt(r2.clamp_min(eps_denom))
-        rball_n = r_ball.index_select(0, n_safe)
-        admissible = (r > beta * rball_n) & is_internal
-
-        if bool(admissible.any()):
-            sub = admissible.nonzero(as_tuple=True)[0]
-            glob = active.index_select(0, sub)
-            n_a = n_area.index_select(0, n_safe.index_select(0, sub))   # (M, 3)
-            d_a = diff.index_select(0, sub)                             # (M, 3)
-            r3 = r.index_select(0, sub).pow(3).clamp_min(eps_denom)
-            dw = (n_a * d_a).sum(dim=-1) * (_INV_4PI / r3)
-            w_accum.scatter_add_(0, glob, dw)
-
-        # ---- Leaf: exact VOS per triangle ----
-        process_leaf = is_leaf & valid
-        if bool(process_leaf.any()):
-            sub = process_leaf.nonzero(as_tuple=True)[0]      # (Nl,)
-            glob = active.index_select(0, sub)
-            leaf_k = (n.index_select(0, sub) - leaf_threshold).to(torch.long)
-            beg = leaf_beg.index_select(0, leaf_k)
-            end = leaf_end.index_select(0, leaf_k)
-            pts = p.index_select(0, sub)                      # (Nl, 3)
-            omega_sum = torch.zeros(pts.shape[0], dtype=torch.float32, device=dev)
-
-            for off in range(leaf_size):
-                tri_pos = beg + off
-                has_tri = tri_pos < end
-                if not bool(has_tri.any()):
-                    break
-                tri_pos_safe = tri_pos.clamp_max(Nt - 1)
-                tri_orig = tri_order.index_select(0, tri_pos_safe)
-                f = F.index_select(0, tri_orig)
-                A = V.index_select(0, f[:, 0]) - pts
-                B = V.index_select(0, f[:, 1]) - pts
-                C = V.index_select(0, f[:, 2]) - pts
-                a_len = torch.linalg.norm(A, dim=-1)
-                b_len = torch.linalg.norm(B, dim=-1)
-                c_len = torch.linalg.norm(C, dim=-1)
-                num = (A * torch.linalg.cross(B, C, dim=-1)).sum(dim=-1)
-                ab = (A * B).sum(dim=-1)
-                bc = (B * C).sum(dim=-1)
-                ca = (C * A).sum(dim=-1)
-                denom = a_len * b_len * c_len + ab * c_len + bc * a_len + ca * b_len + eps_denom
-                omega_tri = 2.0 * torch.atan2(num, denom)
-                omega_tri = torch.where(has_tri, omega_tri, torch.zeros_like(omega_tri))
-                omega_sum = omega_sum + omega_tri
-
-            w_accum.scatter_add_(0, glob, omega_sum * _INV_4PI)
-
-        # ---- Advance: leaves + admissibles skip; descend internals use left ----
-        advance = is_leaf | admissible
-        left_n = left.index_select(0, n_safe)
-        skip_n = skip.index_select(0, n_safe)
-        nxt = torch.where(advance, skip_n, left_n)
-        nxt = torch.where(valid, nxt, neg_one.expand_as(nxt))
-        cur_node.scatter_(0, active, nxt)
-
-        if (it & 31) == 31:
-            alive_mask = cur_node.index_select(0, active) != -1
-            if not bool(alive_mask.all()):
-                active = active[alive_mask]
+    if verbose:
+        print(f"[fwn bfs] max depth={max_depth_reached}  peak worklist={peak_worklist}  "
+              f"peak chunks={peak_chunks}  thresh={thresh}")
 
     return w_accum
 
@@ -1226,14 +1413,15 @@ def mesh_to_sdf_torch_v2(
 ) -> SDFResult:
     """LBVH + Barill FWN SDF pipeline entry point.
 
-    Pipeline (Phase 5 complete):
+    Pipeline (Phase 7):
       1. Build LBVH (Karras 2012) on device.
-      2. cdist vertex-min warm-start (upper bound per query).
-      3. Stackless LBVH traversal → exact unsigned distance |d|.
+      2. Greedy-leaf warm-start: O(Nq · log L) descent giving d_best upper
+         bound; lets BFS prune aggressively from level 0.
+      3. Batched-BFS LBVH traversal → exact unsigned distance |d|.
       4. Central-difference gradient on the non-uniform grid.
       5. Narrow-band classification + safe-shell +1 seeding.
       6. Gradient-consistent Jacobi flood fill (cos_theta_min gate).
-      7. Barill hierarchical FWN on NB ∪ conflict ∪ unknown → exact sign.
+      7. Batched-BFS Barill FWN on NB ∪ conflict ∪ unknown → exact sign.
       8. Assemble phi = sign · |d|, clamp to 2·domain-diagonal.
     """
     dev = pick_device(device)
@@ -1242,8 +1430,6 @@ def mesh_to_sdf_torch_v2(
     if verbose:
         print(f"[v2] LBVH+FWN  device={dev}  "
               f"fwn_beta={fwn_beta} band={fwn_band_width_cells} cos_theta_min={cos_theta_min}")
-
-    mem_budget = 8.0 if target_memory_gb is None else float(target_memory_gb)
 
     # ---- Grid assembly ----
     x_t = torch.as_tensor(x_coords, dtype=torch.float32, device=dev)
@@ -1261,19 +1447,18 @@ def mesh_to_sdf_torch_v2(
     t0 = time.time()
     V = torch.as_tensor(V_np, dtype=torch.float32, device=dev)
     F = torch.as_tensor(F_np, dtype=torch.int64, device=dev)
-    bvh = lbvh.build_lbvh(V, F, leaf_size=4)
+    bvh = lbvh.build_lbvh(V, F, leaf_size=1)
     if verbose:
         print(f"[lbvh] Nt={F.shape[0]} L={bvh.num_leaves} nodes={bvh.num_nodes} "
               f"built in {time.time() - t0:.3f}s")
 
-    # ---- cdist warm-start: tight upper bound per query ----
+    # ---- Greedy-leaf warm-start: tight d_best upper bound, O(Nq·log L) ----
     t0 = time.time()
-    d_best = _cdist_warmstart(Q, V, mem_budget, verbose=verbose)
+    d_best = _greedy_leaf_warmstart(bvh, Q, verbose=verbose)
     if verbose:
-        print(f"[cdist] warm-start {time.time() - t0:.3f}s  "
-              f"d_best range=[{float(d_best.min()):.4f}, {float(d_best.max()):.4f}]")
+        print(f"[warmstart] {time.time() - t0:.3f}s")
 
-    # ---- Full-grid unsigned distance traversal ----
+    # ---- Full-grid unsigned distance via batched-BFS LBVH traversal ----
     t0 = time.time()
     d_best = _lbvh_unsigned_distance(bvh, Q, d_best, verbose=verbose)
     if verbose:
@@ -1338,7 +1523,7 @@ def mesh_to_sdf_torch_v2(
             print(f"[fwn] {time.time() - t0:.3f}s  "
                   f"|w| range=[{float(w.abs().min()):.3f}, {float(w.abs().max()):.3f}]  "
                   f"inside={int(inside_q.sum())}/{n_query}  "
-                  f"ambiguous (|w|∈[0.4,0.6])={mid_mass*100:.2f}%")
+                  f"ambiguous={mid_mass*100:.2f}%")
             if mid_mass > 0.01:
                 print("  WARN: >1% queries have |w|∈[0.4,0.6] — mesh may not be watertight")
 
