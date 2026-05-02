@@ -41,7 +41,6 @@ def create_cube_mesh(side_length=1.0, center=(0.0, 0.0, 0.0)):
     Create a cube mesh with specified side length and center.
     '''
     cube = trimesh.creation.box(extents=[side_length, side_length/1.5, side_length*2.0])
-    # cube = trimesh.creation.box(extents=[side_length, side_length, side_length])
     cube.apply_translation(center)
     return cube
 
@@ -62,7 +61,6 @@ def create_cylinder_mesh(radius=1.0, height=2.0, scale=1.0,
 
 def load_stl_mesh(stl_path, scale=1.0, translate=(0.0, 0.0, 0.0), rotate=(0.0, 0.0, 0.0)):
     """Load and transform STL mesh with positioning control."""
-    # mesh = trimesh.load_mesh(stl_path)
     mesh = trimesh.load(stl_path, process=True)
 
     # If trimesh returns a Scene (multiple bodies), concatenate into a single mesh
@@ -236,9 +234,6 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
         except Exception as e:
             print(f"[preview] Failed to plot stretch preview: {e}")
 
-    # Add visualization of domain and geometry before SDF computation
-    # plot_utils.visualize_domain_and_geometry(mesh_, domain_bounds)  # Comment out for faster processing
-
     # ============ Unified backend selection: torch or trimesh ============
     print(f"\nComputing SDF using method='{method}'...")
 
@@ -256,7 +251,6 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
             fwn_beta=fwn_beta,
             fwn_band_width_cells=fwn_band_width_cells,
             cos_theta_min=cos_theta_min,
-            target_memory_gb=memory_budget_gb,
         )
         sdf = res.phi
         origin = res.origin

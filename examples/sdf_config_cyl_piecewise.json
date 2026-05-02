@@ -63,9 +63,7 @@
     "method": "torch",
     "memory_budget_gb": 8.0,
     "torch": {
-      "device": "mps",
-      "use_accel": true,
-      "compile_kernels": false
+      "device": "mps"
     }
   }
 }

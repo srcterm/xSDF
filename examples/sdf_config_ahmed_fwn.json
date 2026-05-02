@@ -1,13 +1,14 @@
 {
-  "description": "Ahmed body 25deg with piecewise grid stretching (coarse, for testing)",
+  "description": "Ahmed body 25deg with piecewise grid stretching.",
 
   "_comments": {
     "ahmed_bounds": "x: [-1.19, 0.0], y: [-0.18, 0.18], z: [0.05, 0.30]",
-    "piecewise": "CONSTANT=uniform, INCREASING=fine->coarse (CONSTANT left), DECREASING=coarse->fine (CONSTANT right)"
+    "piecewise": "CONSTANT=uniform, INCREASING=fine->coarse (CONSTANT left), DECREASING=coarse->fine (CONSTANT right)",
+    "fwn_beta": "Barill dipole admissibility ratio. 2.0 ~ 4 digits of FWN accuracy; raise to 3.0+ if sign is wrong near thin features."
   },
 
   "output": {
-    "save_name": "AHMED_PWGrid_CS002-STRCH105.h5",
+    "save_name": "AHMED_PWGrid_FWN.h5",
     "visualize": true
   },
 
@@ -37,7 +38,7 @@
         "type": "piecewise",
         "segments": [
           {"type": "DECREASING", "lower_bound": -2.0,  "upper_bound": -1.25},
-          {"type": "CONSTANT",   "lower_bound": -1.25,  "upper_bound":  0.5},
+          {"type": "CONSTANT",   "lower_bound": -1.25, "upper_bound":  0.5},
           {"type": "INCREASING", "lower_bound":  0.5,  "upper_bound":  2.5}
         ]
       },
@@ -52,7 +53,7 @@
       "z": {
         "type": "piecewise",
         "segments": [
-          {"type": "CONSTANT",   "lower_bound": 0.0, "upper_bound": 0.35},
+          {"type": "CONSTANT",   "lower_bound": 0.0,  "upper_bound": 0.35},
           {"type": "INCREASING", "lower_bound": 0.35, "upper_bound": 1.0}
         ]
       }
@@ -64,7 +65,10 @@
     "method": "torch",
     "memory_budget_gb": 8.0,
     "torch": {
-      "device": "cpu"
+      "device": "mps",
+      "fwn_beta": 2.0,
+      "fwn_band_width_cells": 3.0,
+      "cos_theta_min": 0.8
     }
   }
 }

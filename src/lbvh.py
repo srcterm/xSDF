@@ -1,16 +1,20 @@
 """Linear Bounding Volume Hierarchy (Karras 2012), pure-PyTorch, device-parallel.
 
-Phase 1 scope: Morton codes + radix sort + Karras internal-node construction
-+ bottom-up AABB aggregation (ready-counter pattern) + skip-pointer computation
-via pointer-jumping. No CUDA atomics; no host-side DFS; no serial prefix-sum.
+Build pipeline (all work on V.device):
+  1. 30-bit Morton codes over per-triangle centroids; ascending torch.sort.
+  2. Karras et al.(2012) longest-common-prefix construction over the L sorted
+     leaves: per-node range determination + split index, all branch-free.
+  3. Bottom-up AABB + Barill et al. (2018) dipole aggregation
+     (area_w, c_area, n_area) via the ready-counter pattern.
+  4. Barill et al. (2018) r_ball: farthest AABB-corner distance from the area-weighted
+     centroid (used as the tight far-field bound in FWN traversal).
+  5. Skip pointers via pointer-jumping. the production query kernels in src/torch-meshSDF.py traverse via
+     chunked BFS.
 
-Node indexing (unified, size 2L-1 where L = ceil(Nt/leaf_size)):
+Node indexing (unified, size 2L-1 where L = ⌈Nt/leaf_size⌉):
     [0, L-1)    : internal nodes, root = 0
-    [L-1, 2L-1) : leaf nodes
-leaf node k is at index (L - 1 + k).
+    [L-1, 2L-1) : leaf nodes; leaf k lives at index (L - 1 + k).
 
-SoA layout chosen so every kernel sees dense float32/int32 tensors and the
-query kernels in Stage 2+ can stackless-traverse with simple gathers.
 """
 
 from __future__ import annotations
@@ -47,7 +51,7 @@ class LBVH:
     leaf_tri_beg: torch.Tensor     # (L,) int32
     leaf_tri_end: torch.Tensor     # (L,) int32
 
-    # Barill dipole fields (populated in Phase 2; zeros in Phase 1)
+    # Barill dipole fields
     area_w: Optional[torch.Tensor] = None   # (2L-1,) float32
     c_area: Optional[torch.Tensor] = None   # (2L-1, 3) float32 — Σ area · centroid
     n_area: Optional[torch.Tensor] = None   # (2L-1, 3) float32 — Σ area · unit_normal
@@ -173,7 +177,6 @@ def _karras_build_internals(morton: torch.Tensor, L: int):
 
     Returns:
         left_child, right_child, parent : (2L-1,) int32 each
-        first, last                     : (L-1,) int32 ranges per internal node
     """
     device = morton.device
     K = L - 1  # number of internal nodes
@@ -185,8 +188,7 @@ def _karras_build_internals(morton: torch.Tensor, L: int):
 
     if K <= 0:
         # Single leaf: tree is the leaf itself. Empty internal arrays.
-        empty32 = torch.empty((0,), dtype=torch.int32, device=device)
-        return left, right, parent, empty32, empty32
+        return left, right, parent
 
     i_arr = torch.arange(K, dtype=torch.int32, device=device)
 
@@ -250,7 +252,7 @@ def _karras_build_internals(morton: torch.Tensor, L: int):
     parent.scatter_(0, left_child.to(torch.long),  i_arr)
     parent.scatter_(0, right_child.to(torch.long), i_arr)
 
-    return left, right, parent, first, last
+    return left, right, parent
 
 
 # =============================================================================
@@ -283,7 +285,10 @@ def _aggregate_bottom_up(L: int,
 
     Each internal node becomes ready once both children have propagated; we
     then fold its subtree's AABB and (if provided) dipole fields into it.
-    Converges in ⌈log2 L⌉ + 2 outer iterations.
+    Outer-iteration count is bounded by Karras-tree depth (≤ ~30 for 30-bit
+    Morton codes — not log2(L), since equal-Morton ties extend the prefix);
+    the loop breaks early once no node is still propagating, with a
+    64-iteration safety cap.
 
     Returns (aabb_min, aabb_max, area_w, c_area, n_area). Dipole outputs are
     None iff the corresponding inputs are None.
@@ -315,8 +320,8 @@ def _aggregate_bottom_up(L: int,
     done[L - 1:] = True  # leaves propagate upward first
     propagated = torch.zeros(N, dtype=torch.bool, device=device)
 
-    # Karras-tree depth is bounded by the longest common Morton prefix, which
-    # for 30-bit codes can approach 30 — not log2(L). We loop generously and
+    # Karras-tree depth is bounded by the Morton prefix, which
+    # for 30-bit codes can approach 30 — not log2(L). Loop and
     # rely on the early break when no nodes are activating.
     max_iters = 64
     for _ in range(max_iters):
@@ -410,7 +415,7 @@ def _build_skip_pointers(left: torch.Tensor,
 
 
 # =============================================================================
-# Public API
+# API
 # =============================================================================
 
 def build_lbvh(V: torch.Tensor,
@@ -419,18 +424,23 @@ def build_lbvh(V: torch.Tensor,
                leaf_size: int = 4) -> LBVH:
     """Build an LBVH for the triangle mesh (V, F).
 
-    All work happens on V.device. No host↔device syncs beyond a single
-    early-exit check per aggregation iteration (log2(L)+2 total).
+    All work happens on V.device. The only host↔device sync is the
+    early-exit check per aggregation iteration (≤ Karras-tree depth, ~30
+    for 30-bit Morton codes).
 
     Args:
         V: (Nv, 3) float32 vertex positions.
         F: (Nt, 3) int64 triangle indices.
-        leaf_size: Max triangles per leaf (default 4). Larger values reduce
-                   tree depth at the cost of more per-leaf brute-force work.
+        leaf_size: Max triangles per leaf (default 4). Production callers
+                   in src/torch-meshSDF.py pass leaf_size=1 explicitly;
+                   larger values reduce tree depth at the cost of more
+                   per-leaf brute-force work.
 
     Returns:
-        LBVH with AABBs, child/parent/skip pointers, and leaf tri ranges.
-        Dipole fields (area_w, c_area, n_area, r_ball) are None in Phase 1.
+        LBVH populated with: tree topology (left/right/parent/skip),
+        per-node AABBs (aabb_min/max), per-leaf triangle ranges
+        (leaf_tri_beg/end), and Barill dipole fields
+        (area_w, c_area, n_area, r_ball) for FWN.
     """
     assert V.dtype == torch.float32, f"V must be float32, got {V.dtype}"
     assert V.dim() == 2 and V.shape[1] == 3, f"V must be (Nv, 3), got {tuple(V.shape)}"
@@ -488,7 +498,7 @@ def build_lbvh(V: torch.Tensor,
     leaf_morton = morton_sorted.index_select(0, leaf_tri_beg.to(torch.long))
 
     # ---- Karras internal nodes ----
-    left, right, parent, _first, _last = _karras_build_internals(leaf_morton, L)
+    left, right, parent = _karras_build_internals(leaf_morton, L)
 
     # ---- Per-triangle dipole quantities (Barill 2018) ----
     # cross = (B - A) x (C - A) has magnitude 2*area and direction = 2*area*unit_normal.
