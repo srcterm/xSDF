@@ -41,7 +41,6 @@ def create_cube_mesh(side_length=1.0, center=(0.0, 0.0, 0.0)):
     Create a cube mesh with specified side length and center.
     '''
     cube = trimesh.creation.box(extents=[side_length, side_length/1.5, side_length*2.0])
-    # cube = trimesh.creation.box(extents=[side_length, side_length, side_length])
     cube.apply_translation(center)
     return cube
 
@@ -62,7 +61,6 @@ def create_cylinder_mesh(radius=1.0, height=2.0, scale=1.0,
 
 def load_stl_mesh(stl_path, scale=1.0, translate=(0.0, 0.0, 0.0), rotate=(0.0, 0.0, 0.0)):
     """Load and transform STL mesh with positioning control."""
-    # mesh = trimesh.load_mesh(stl_path)
     mesh = trimesh.load(stl_path, process=True)
 
     # If trimesh returns a Scene (multiple bodies), concatenate into a single mesh
@@ -131,10 +129,11 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
           scale=1.0, translate=(0.0, 0.0, 0.0), rotate=(0.0, 0.0, 0.0),
           method='trimesh',
           memory_budget_gb=None,
-          # Torch SDF options (fp32 only)
+          # Torch SDF options (LBVH + Barill FWN pipeline)
           torch_device='mps',
-          torch_use_accel=True,
-          compile_kernels=False,
+          fwn_beta: float = 2.0,
+          fwn_band_width_cells: float = 3.0,
+          cos_theta_min: float = 0.8,
           # Grid coordinate options (non-uniform by default, set r_max=1.0 for uniform)
           stretch_axes: Optional[Dict[str, Dict]] = None,
           preview_stretch: bool = False
@@ -235,9 +234,6 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
         except Exception as e:
             print(f"[preview] Failed to plot stretch preview: {e}")
 
-    # Add visualization of domain and geometry before SDF computation
-    # plot_utils.visualize_domain_and_geometry(mesh_, domain_bounds)  # Comment out for faster processing
-
     # ============ Unified backend selection: torch or trimesh ============
     print(f"\nComputing SDF using method='{method}'...")
 
@@ -248,13 +244,13 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
         print("Using PyTorch SDF backend (torch-meshSDF.py)...")
         V_np = np.asarray(mesh_.vertices, dtype=np.float32)
         F_np = np.asarray(mesh_.faces, dtype=np.int64)
-        res = torch_meshSDF.mesh_to_sdf_torch(
+        res = torch_meshSDF.mesh_to_sdf_torch_v2(
             V_np, F_np,
             x_coords, y_coords, z_coords,
             device=torch_device,
-            compile_kernels=compile_kernels,
-            use_accel=torch_use_accel,
-            target_memory_gb=memory_budget_gb,
+            fwn_beta=fwn_beta,
+            fwn_band_width_cells=fwn_band_width_cells,
+            cos_theta_min=cos_theta_min,
         )
         sdf = res.phi
         origin = res.origin
@@ -329,9 +325,10 @@ if __name__ == "__main__":
         preview_stretch=cfg['grid']['preview_stretch'],
         method=cfg['backend']['method'],
         memory_budget_gb=cfg['backend']['memory_budget_gb'],
-        torch_device=cfg['backend']['torch']['device'],
-        torch_use_accel=cfg['backend']['torch']['use_accel'],
-        compile_kernels=cfg['backend']['torch']['compile_kernels']
+        torch_device=cfg['backend']['torch'].get('device', 'mps'),
+        fwn_beta=cfg['backend']['torch'].get('fwn_beta', 2.0),
+        fwn_band_width_cells=cfg['backend']['torch'].get('fwn_band_width_cells', 3.0),
+        cos_theta_min=cfg['backend']['torch'].get('cos_theta_min', 0.8),
     )
 
     print(f"Done in {(time.time()-t0)/60:.2f} min ({(time.time()-t0):.2f} sec)")
