@@ -20,25 +20,25 @@ xSDF is very fast. It's fully vectorized and use a mix of various accelerated me
 
 Result on the Stanford bunny (1.75 M voxels, 70 k triangles, `Apple M4`):
 
-| Backend            | Wall time | Speedup (vs Trimesh) |
+<!-- | Backend            | Wall time | Speedup (vs Trimesh) |
 |--------------------|----------:|-------------------:|
 | Trimesh (CPU)      |  2591.2 s |               1.0× |
 | **xSDF (MPS)**       | **13.4 s**|         **194 ×**  |
-| **xSDF (CPU)**       | **13.2 s**|         **196 ×**  |
+| **xSDF (CPU)**       | **13.2 s**|         **196 ×**  | -->
 
-100% sign agreement against Trimesh. Note: MPS is slightly slower than CPU due to BFS per-launch dispatch overhead (torch.compile not available on MPS to fuse).
+<!-- 100% sign agreement against Trimesh. Note: MPS is slightly slower than CPU due to BFS per-launch dispatch overhead (torch.compile not available on MPS to fuse). -->
 
 <p align="center">
-<img src="docs/stanford_bunny_speedup.png" alt="xSDF vs Trimesh wall time on the Stanford bunny" width="650"/>
+<img src="docs/stanford_bunny_speedup.png" alt="xSDF vs Trimesh wall time on the Stanford bunny" width="600"/>
 </p>
 
 SDF accuracy evaluation on the bunny showing a mid-plane slice (z=0)
 
 <p align="center">
-<img src="docs/stanford_bench.png" alt="Bunny SDF: xSDF vs Trimesh mid-z slice" width="750"/>
+<img src="docs/stanford_bench.png" alt="Bunny SDF: xSDF vs Trimesh mid-z slice" width="600"/>
 </p>
 
-
+100% sign agreement against Trimesh. Note: MPS is slightly slower than CPU due to BFS per-launch dispatch overhead (torch.compile not available on MPS to fuse).
 
 ### Basic Usage
 
@@ -64,13 +64,13 @@ This loads the STL, builds a piecewise-stretched grid clustered around the body,
 The config (`examples/sdf_config_ahmed_piecewise.json`) is the simplest way to get started: edit the domain bounds, the STL path, and the stretch parameters to fit your geometry. You will be prompted with a visual of the geometry in the defined domain:
 
 <p align="center">
-<img src="docs/AHMED_PIECEWISE.png" alt="Ahmed body piecewise grid preview" width="600"/>
+<img src="docs/AHMED_PIECEWISE.png" alt="Ahmed body piecewise grid preview" width="650"/>
 </p>
 
 After computation, the complete SDF is shown visually: 
 
 <p align="center">
-<img src="docs/AHMED_PIECEWISE_SDF.png" alt="Ahmed body SDF slice" width="400"/>
+<img src="docs/AHMED_PIECEWISE_SDF.png" alt="Ahmed body SDF slice" width="500"/>
 </p>
 
 ### Configuration Reference
@@ -209,17 +209,17 @@ See `/examples` for various config examples using the Ahmed body case for the di
 ### Uniform Grid
 
 <p align="center">
-<img src="docs/AHMED_UNIFORM_dx005.png" alt="Ahmed body uniform grid" width="600"/>
+<img src="docs/AHMED_UNIFORM_dx005.png" alt="Ahmed body uniform grid" width="650"/>
 </p>
 
 ### Non-Uniform Grid, Center-Point Stretching
 <p align="center">
-<img src="docs/AHMED_CENTERPOINT.png" alt="Ahmed body center-point stretched grid" width="600"/>
+<img src="docs/AHMED_CENTERPOINT.png" alt="Ahmed body center-point stretched grid" width="650"/>
 </p>
 
 ### Non-Uniform Grid, Piecewise Stretching
 <p align="center">
-<img src="docs/AHMED_PIECEWISE.png" alt="Ahmed body piecewise grid preview" width="600"/>
+<img src="docs/AHMED_PIECEWISE.png" alt="Ahmed body piecewise grid preview" width="650"/>
 </p>
 
 
