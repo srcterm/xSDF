@@ -1,61 +1,81 @@
-# xSDF 
+# xSDF
 
-Fast generation of Signed Distance Fields (SDF) for combined geometrical meshes and domains, specifically for boundary immersion method, computational fluid dynamics (CFD) on cartesian grids & geometric deep learning (GDL) applications, using graph neural network architectures.
+Fast generation of Signed Distance Functions (SDF) for combined geometrical meshes and domains, specifically for boundary immersion methods, computational fluid dynamics (CFD) on cartesian grids, but also for geometric deep learning (GDL) applications using graph neural network architectures.
 
-SDF computation is implemented in `PyTorch` for GPU acceleration. For large domains, uniform grids often require excessive resolution in far-field regions where it's unnecessary. To address this, the tool supports non-uniform grid generation through geometric stretching, concentrating resolution near geometry interfaces while maintaining coarser far-field spacing.
+The SDF computation runs on PyTorch and is device-agnostic (CUDA / Apple MPS / CPU). For large domains, uniform grids often waste resolution in far-field regions. xSDF supports non-uniform grid generation via geometric stretching, concentrating cells near the geometry while keeping the far-field coarse.
 
-### Features:
+### Features
 
-- GPU accleration using PyTorch tensors (Apple M-series GPU support via MPS backend)
-- Axis-Aligned Bounding Box (AABB) fast overlap checking & triangle pruning 
-- Solid-Angle method (winding number) signing
-- Automatic & adaptive memory managment to avoid RAM overflow
-- Support for uniform & non-uniform (center-point & piecewise multi-segment) grid generation
-- lightwieght HDF5 file output (.h5)
+xSDF is very fast. It's fully vectorized and use a mix of various accelerated methods for both query and signing. This code features:
 
-#### Speed & Performance:
+- **GPU acceleration** via PyTorch (CUDA, Apple MPS, or CPU).
+- **Linear Bounding Volume Hierarchy (LBVH)** device-parallel BVH with Morton-sort + longest-common-prefix construction, built on `device` (Karras et al., 2018).
+- **Greedy-leaf warm-start + batched-BFS LBVH traversal** for exact unsigned distance. Kernel launches scale with tree depth, not per-query path length. Chunked for memory safety.
+- **Hierarchical Fast Winding Number (FWN)** for fast sign assignment (Barill et al.,2018) .
+- **Gradient-consistent flood fill**, FWN pass only runs where needed (around geom. + narrow band) and not on the entire grid (large domain accelerator).
+- **Geometric grid stretching**: uniform, center-point single-stretch, or piecewise multi-segment per-axis.
+- **HDF5 output** (`.h5`) with grid metadata (`levelset`, `x/y/z_coords`, `origin`, `grid_size`, `non_uniform_grid`).
 
-A speed performance comparison is given below for 128k grid points on an Apple M4 (CPU/GPU 10/10-core) macbook running either trimesh or xSDF torch backend.
+#### Speed & Performance
+
+Result on the Stanford bunny (1.75 M voxels, 70 k triangles, `Apple M4`):
+
+| Backend            | Wall time | Speedup (vs Trimesh) |
+|--------------------|----------:|-------------------:|
+| Trimesh (CPU)      |  2591.2 s |               1.0× |
+| **xSDF (MPS)**       | **13.4 s**|         **194 ×**  |
+| **xSDF (CPU)**       | **13.2 s**|         **196 ×**  |
+
+100% sign agreement against Trimesh. Note: MPS is slightly slower than CPU due to BFS per-launch dispatch overhead (torch.compile not available on MPS to fuse).
 
 <p align="center">
-<img src="docs/elliptic_foil_speedup.png" alt="speedup" width="600"/>
+<img src="docs/stanford_bunny_speedup.png" alt="xSDF vs Trimesh wall time on the Stanford bunny" width="650"/>
 </p>
 
-xSDF performance is ~5x faster on GPU than trimesh. For large-scale meshes, the speed-up is expected to be significant when offloading to a CUDA supported GPU. (Some comparison figures to be added -TBA) 
+SDF accuracy evaluation on the bunny showing a mid-plane slice (z=0)
 
-### Basic Usage:
+<p align="center">
+<img src="docs/stanford_bench.png" alt="Bunny SDF: xSDF vs Trimesh mid-z slice" width="750"/>
+</p>
 
-1. **Configure** case in `sdf_config.json`
+
+
+### Basic Usage
+
+1. **Configure** a case in `sdf_config.json` (or copy one from `examples/`).
 2. **Run** the generator:
 
 ```bash
-python xSDF.py                    # Use sdf_config.json
-python xSDF.py my_config.json     # Use a custom config
+python xSDF.py                              # use sdf_config.json
+python xSDF.py my_config.json               # use a custom config
+python xSDF.py examples/sdf_config_bunny.json
 ```
 
 #### Quickstart: SDF from STL (Ahmed body)
 
-The repo includes a ready-to-run Ahmed body example. Generate an SDF from `examples/ahmed_1.stl` with one command:
+The repo ships a ready-to-run Ahmed body example. Generate an SDF from `examples/ahmed_1.stl` with one command:
 
 ```bash
 python xSDF.py examples/sdf_config_ahmed_piecewise.json
 ```
 
-This loads the STL, builds a geometrically-stretched grid clustered around the body, previews the grid (close the window to proceed), and writes the SDF to an HDF5 file.
+This loads the STL, builds a piecewise-stretched grid clustered around the body, previews the grid (close the window to proceed), and writes the SDF to an HDF5 file.
 
-The config (`examples/sdf_config_ahmed_piecewise.json`) is the simplest way to get started: edit the domain bounds, the STL path, and the stretch parameters to fit your geometry.
+The config (`examples/sdf_config_ahmed_piecewise.json`) is the simplest way to get started: edit the domain bounds, the STL path, and the stretch parameters to fit your geometry. You will be prompted with a visual of the geometry in the defined domain:
 
 <p align="center">
 <img src="docs/AHMED_PIECEWISE.png" alt="Ahmed body piecewise grid preview" width="600"/>
 </p>
 
+After computation, the complete SDF is shown visually: 
+
 <p align="center">
 <img src="docs/AHMED_PIECEWISE_SDF.png" alt="Ahmed body SDF slice" width="400"/>
 </p>
 
-### Configuration Reference Docs
+### Configuration Reference
 
-A full xSDF config file is a JSON document with five top-level sections: `output`, `domain`, `geometry`, `grid`, and `backend`. The Ahmed body example (`examples/sdf_config_ahmed_piecewise.json`) is annotated below as a reference.
+A full xSDF config is a JSON document with five top-level sections: `output`, `domain`, `geometry`, `grid`, and `backend`. The Ahmed body example (`examples/sdf_config_ahmed_piecewise.json`) is annotated below as a reference.
 
 #### `output`
 
@@ -69,7 +89,7 @@ A full xSDF config file is a JSON document with five top-level sections: `output
 | Field        | Description |
 |--------------|-------------|
 | `save_name`  | HDF5 file written by xSDF. Contains `levelset`, `x_coords`, `y_coords`, `z_coords`, `origin`, `grid_size`, and a `non_uniform_grid` attribute. |
-| `visualize`  | If `true`, post-run plotting routines are called on the saved H5 (slices through the SDF, isosurface, etc.). Set `false` for headless/batch runs. |
+| `visualize`  | If `true`, post-run plotting routines are called on the saved H5 (slices through the SDF, isosurface, etc.). Set `false` for headless / batch runs. |
 
 #### `domain`
 
@@ -83,7 +103,7 @@ A full xSDF config file is a JSON document with five top-level sections: `output
 }
 ```
 
-The domain block defines the cartesian bounding box that the SDF will be evaluated over. Bounds are in the same length units as the STL geometry. The first/last face position on each axis is snapped to these exact bounds, regardless of the stretching method.
+The domain block defines the cartesian bounding box that the SDF will be evaluated over. Bounds are in the same length units as the geometry. The first/last face position on each axis is snapped to these exact bounds, regardless of the stretching method.
 
 #### `geometry`
 
@@ -101,13 +121,13 @@ The domain block defines the cartesian bounding box that the SDF will be evaluat
 
 | Field    | Description |
 |----------|-------------|
-| `type`   | `"stl"` to load a mesh from disk, or `"cube"` / `"cylinder"` to use a built-in primitive (handy for sanity checks without an STL). |
-| `path`   | Path to the mesh file (`.stl`, `.ply`, etc.) — only used when `type = "stl"`. |
+| `type`   | `"stl"` to load a mesh from disk (handles `.stl`, `.ply`, `.obj`, etc. via `trimesh.load`), or `"cube"` / `"cylinder"` for a built-in primitive (handy for sanity checks without an STL). |
+| `path`   | Path to the mesh file — only used when `type = "stl"`. |
 | `transformations.scale`     | Uniform scale factor applied to the mesh vertices before placement. Use this to convert mm → m (e.g. `0.001`) or to upscale a unit-cube STL. |
 | `transformations.translate` | `[tx, ty, tz]` offset applied **after scaling**. Use this to position the geometry within the `domain.bounds` block. |
 | `transformations.rotate`    | `[rx, ry, rz]` Euler rotation angles in **degrees**, applied via `trimesh.transformations.euler_matrix`. Use this to set angle of attack, sideslip, or yaw. |
 
-The transformation order is: **scale → rotate → translate**. After loading and transforming the mesh, xSDF reports the resulting bounds and watertightness, and (if needed) attempts a normal/winding repair so the SDF sign is reliable.
+The transformation order is: **scale → rotate → translate**. After loading and transforming the mesh, xSDF reports the resulting bounds and watertightness. xSDF does **not** auto-run `pymeshfix`; if your mesh has large open holes (e.g. the raw Stanford bunny scan), pre-repair it — see how `tests/bench_stanford.load_and_repair` does this. FWN signs non-watertight meshes gracefully, but the gradient flood fill can leak through large holes if the gradient field on either side of the hole is consistent.
 
 #### `grid`
 
@@ -124,7 +144,7 @@ The transformation order is: **scale → rotate → translate**. After loading a
 |-------------------|-------------|
 | `target_min_size` | Default fine cell size. Used as `dx_min` (center-point) or `dx_target` (piecewise) when an axis leaves it `null` / unspecified. |
 | `stretch_factor`  | Default geometric growth ratio. Used as `r_max` (center-point) or `r_target` (piecewise) when not overridden per-axis. |
-| `preview_stretch` | If `true`, a matplotlib window pops up showing the 1D coordinate distributions and a 3D scatter of the face-vertex grid with the geometry overlaid. **Close the window to proceed**, or cancel to abort the run before the SDF computation. |
+| `preview_stretch` | If `true`, a matplotlib window pops up showing the 1D coordinate distributions and a 3D scatter of the face-vertex grid with the geometry overlaid. **Close the window to proceed**, or cancel to abort the run before SDF computation. |
 
 `stretch_axes` holds a per-axis sub-block (`x`, `y`, `z`). Two stretching modes are supported:
 
@@ -153,7 +173,7 @@ The transformation order is: **scale → rotate → translate**. After loading a
 }
 ```
 
-The `segments` list is ordered lower-to-upper along the axis. Each entry has a `type` (`CONSTANT`, `INCREASING`, or `DECREASING`) and `[lower_bound, upper_bound]`. `dx_target` and `r_target` inherit from `target_min_size` and `stretch_factor` unless overridden in the sub-block.
+The `segments` list is ordered lower-to-upper along the axis. Each entry has a `type` (`CONSTANT`, `INCREASING`, or `DECREASING`) and `[lower_bound, upper_bound]`. `dx_target` and `r_target` inherit from `target_min_size` and `stretch_factor` unless overridden in the sub-block. See [`docs/stretching_methods.md`](docs/stretching_methods.md) for the full reference.
 
 #### `backend`
 
@@ -163,34 +183,38 @@ The `segments` list is ordered lower-to-upper along the axis. Each entry has a `
   "memory_budget_gb": 8.0,
   "torch": {
     "device": "mps",
-    "use_accel": true,
-    "compile_kernels": false
+    "fwn_beta": 2.0,
+    "fwn_band_width_cells": 3.0,
+    "cos_theta_min": 0.8
   }
 }
 ```
 
-| Field                 | Description |
-|-----------------------|-------------|
-| `method`              | `"torch"` for the GPU-accelerated backend (recommended), or `"trimesh"` for the CPU fallback. |
-| `memory_budget_gb`    | Soft cap on peak working memory incase you want to use lower than max. available. Both backends use this to chunk the grid and stay under the limit; lower it if you hit OOM. |
-| `torch.device`        | `"cuda"`, `"mps"` (Apple silicon), or `"cpu"`. |
-| `torch.use_accel`     | Enables the AABB triangle pruning + winding-number signing accelerator path. |
-| `torch.compile_kernels` | Wraps the inner kernels in `torch.compile` for an extra speedup. Adds JIT warmup time on the first run. |
+| Field                      | Description |
+|----------------------------|-------------|
+| `method`                   | `"torch"` for the LBVH+FWN GPU backend (default), or `"trimesh"` for fallback and testing. |
+| `memory_budget_gb`         | Memory budget consumed by the **trimesh** backend only (controls its grid chunk size). The torch backend uses a fixed empirical MPS-safe chunk threshold internally and ignores this field. |
+| `torch.device`             | `"cuda"`, `"mps"` (Apple silicon), or `"cpu"`. |
+| `torch.fwn_beta`           | Barill dipole admissibility ratio (default `2.0` — ~4 digits FWN accuracy). Raise to `3.0+` if sign is wrong near thin features. |
+| `torch.fwn_band_width_cells` | Width of the narrow band around the surface, in cells (default `3.0`). Voxels inside this band always get exact FWN signing; outside it, the gradient flood fill runs first and FWN only revisits conflicts and unresolved voxels. |
+| `torch.cos_theta_min`      | Gradient-alignment threshold for flood-fill voting (default `0.8`). Higher = more conservative propagation; lower = more aggressive. |
+
+A standalone FWN-tuning example: `examples/sdf_config_ahmed_fwn.json`.
 
 
 ## Examples of different grids
 
-See `/examples` for various config. examples using the different grid types.
+See `/examples` for various config examples using the Ahmed body case for the different grid types.
 
 ### Uniform Grid
 
 <p align="center">
-<img src="docs/AHMED_UNIFORM_dx005.png" alt="speedup" width="600"/>
+<img src="docs/AHMED_UNIFORM_dx005.png" alt="Ahmed body uniform grid" width="600"/>
 </p>
 
 ### Non-Uniform Grid, Center-Point Stretching
 <p align="center">
-<img src="docs/AHMED_CENTERPOINT.png" alt="speedup" width="600"/>
+<img src="docs/AHMED_CENTERPOINT.png" alt="Ahmed body center-point stretched grid" width="600"/>
 </p>
 
 ### Non-Uniform Grid, Piecewise Stretching
@@ -198,71 +222,21 @@ See `/examples` for various config. examples using the different grid types.
 <img src="docs/AHMED_PIECEWISE.png" alt="Ahmed body piecewise grid preview" width="600"/>
 </p>
 
+
 ## Final Note
 
-Hopefully this code may be useful to someone, any bugs or issues, just let me know!
+Hopefully this code may be useful — bugs and issues, just let me know!
 
-## To Dos, features, etc.
-- Speed tests on NVIDIA hardware and `torch.compile()`
-- Implement Bounding Volume Hierchary (BVH) as optional accel method (or default depending on speed-up)
+## To Dos
+- Speed tests on CUDA. 
+- Gradient exposure.
+- Surface Area Heuristic (SAH), fix for MPS dispatch overhead as LBVH -> LHBVH?
+
 
 
 ## References
 
-- **Solid Angle Method**: Van Oosterom & Strackee, "The Solid Angle of a Plane Triangle" (1983)
+- **LBVH**: Karras, "Maximizing Parallelism in the Construction of BVHs, Octrees, and k-d Trees", High Performance Graphics (2012)
+- **Fast Winding Number (FWN)**: Barill, Dickson, Schmidt, Levin, Jacobson, "Fast Winding Numbers for Soups and Clouds", SIGGRAPH (2018)
+- **Solid Angle Signing (on FWN leaf evaluation)**: Van Oosterom & Strackee, "The Solid Angle of a Plane Triangle" (1983)
 - **Point-Triangle Distance (AABB)**: Ericson. C, "Real-Time Collision Detection" (2004)
-
-
-<!-- 
-----
-
-#### Example with Uniform Grid:
-
-An elliptical foil test case is used as a base example on a uniform grid. The ellptical foil section is imported as a .stl file and handled as a trimesh mesh object. For a CFD case setup, xSDF supports creation of a block domain and translation/rotation of imported geometries within the specified domain. The test case here is shown on a 80x40x40 grid with 128k voxels of uniform spacing.
-
-Once the case is setup and executed, the geometry and grid will be previewed to confirm whether all is as expected, before proceeding with the SDF computation.
-
-<img src="docs/AHMED_UNIFORM_dx005.png" alt="speedup" width="600"/>
-
-The final output SDF is given as a .HDF5 file.
-
-
-## Example with Non-Uniform Grid, Center-Point Stretching
-
-With grid stretching on the same case:
-
-<img src="docs/AHMED_CENTERPOINT.png" alt="speedup" width="600"/>
-
-<!-- with final SDF evaluation given as, -->
-
-<!-- <img src="docs/elliptic_foil_sdf_128k.png" alt="speedup" width="550"/> -->
-
-<!-- 
-### Example with Non-Uniform Grid, Piecewise Stretching
-
-For external flow cases like the Ahmed body, a center-point geometric stretch wastes resolution. xSDF supports **piecewise multi-segment stretching** where each axis can mix uniform fine-spacing regions (`CONSTANT`) with geometric coarsening toward the boundaries (`INCREASING`/`DECREASING`).
-
-Run the Ahmed body case with piecewise stretching:
-
-```bash
-python xSDF.py examples/sdf_config_ahmed_piecewise.json
-```
-
-The config (`examples/sdf_config_ahmed_piecewise.json`) defines per-axis segments:
-
-
-<img src="docs/AHMED_PIECEWISE.png" alt="Ahmed body piecewise grid preview" width="600"/>
-
-Hopefully this code may be useful to someone, any bugs or issues, just let me know!
-
-## To Dos, features, etc.
-- Speed tests on NVIDIA hardware and `torch.compile()`
-- Implement Bounding Volume Hierchary (BVH) as optional accel method (or default depending on speed-up)
-
-
-## References
-
-- **Solid Angle Method**: Van Oosterom & Strackee, "The Solid Angle of a Plane Triangle" (1983)
-- **Point-Triangle Distance (AABB)**: Ericson. C, "Real-Time Collision Detection" (2004) -->
-
-
