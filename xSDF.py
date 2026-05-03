@@ -197,7 +197,7 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
                 cfg["segments"], cfg["dx_target"], cfg["r_target"])
 
         # Extract parameters with sensible defaults
-        center = cfg.get("center", 0.5 * (a + b))  # default to domain center
+        center = cfg.get("center", 0.5 * (a + b))  # default to domain center (need to expose this later for control)
         dx_min = cfg.get("dx_min", target_voxel_size)  # default to target size
         r_max = cfg.get("r_max", 1.0)  # default to uniform (no stretching)
 
@@ -244,6 +244,8 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
         print("Using PyTorch SDF backend (torch-meshSDF.py)...")
         V_np = np.asarray(mesh_.vertices, dtype=np.float32)
         F_np = np.asarray(mesh_.faces, dtype=np.int64)
+        
+        t_sdf = time.perf_counter() # Time the SDF evaluation only
         res = torch_meshSDF.mesh_to_sdf_torch_v2(
             V_np, F_np,
             x_coords, y_coords, z_coords,
@@ -252,12 +254,17 @@ def main(domain_bounds, save_name, target_voxel_size=0.5, geom='cube', geom_path
             fwn_band_width_cells=fwn_band_width_cells,
             cos_theta_min=cos_theta_min,
         )
+        t_sdf = time.perf_counter() - t_sdf
         sdf = res.phi
         origin = res.origin
+        print(f"\n >> [Total SDF compute] {t_sdf:.2f}s  (torch / {torch_device})")
     elif method == 'trimesh':
         # CPU trimesh SDF computation
         print("Using trimesh CPU backend...")
+        t_sdf = time.perf_counter()
         sdf, origin, coord_dict = trimesh_meshSDF.mesh_to_sdf_trimesh(mesh_, x_coords, y_coords, z_coords, memory_budget_gb)
+        t_sdf = time.perf_counter() - t_sdf
+        print(f"\n >> [Total SDF compute] {t_sdf:.2f}s  (trimesh / cpu)")
     else:
         raise ValueError(f"Unknown method '{method}'. Choose 'torch' or 'trimesh'.")
 
@@ -310,9 +317,7 @@ if __name__ == "__main__":
     print(f"Loading configuration from: {config_file}")
     cfg = load_config(config_file)
 
-    t0 = time.time()
-
-    # Run SDF computation
+    # Run SDF computation.
     sdf = main(
         domain_bounds=cfg['domain']['bounds'],
         save_name=cfg['output']['save_name'],
@@ -330,8 +335,6 @@ if __name__ == "__main__":
         fwn_band_width_cells=cfg['backend']['torch'].get('fwn_band_width_cells', 3.0),
         cos_theta_min=cfg['backend']['torch'].get('cos_theta_min', 0.8),
     )
-
-    print(f"Done in {(time.time()-t0)/60:.2f} min ({(time.time()-t0):.2f} sec)")
 
     # Visualize the results
     if cfg['output']['visualize'] and sdf is not None:
