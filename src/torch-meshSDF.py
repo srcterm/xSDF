@@ -1112,6 +1112,39 @@ def _to_dev(t, dtype, dev):
     return torch.as_tensor(t, dtype=dtype, device=dev)
 
 
+def build_bvh(V, F, *, device=None, leaf_size: int = 1) -> "lbvh.LBVH":
+    """Pre-build the LBVH for repeated queries on the same mesh.
+
+    Pass the returned object as `bvh=` to `compute_sdf` / `compute_grad`
+    on subsequent calls to skip the per-call build. Sub-millisecond on
+    procedural meshes; ~50–100 ms on ShapeNet-scale meshes — saved on
+    every reuse.
+
+    The build doesn't depend on autograd, so V is detached internally;
+    callers can still pass V with `requires_grad=True` to `compute_sdf`
+    / `compute_grad` and ∇_V will flow through the per-call differentiable
+    re-evaluation step.
+
+    Args:
+        V: (Nv, 3) float — mesh vertices. Tensor or numpy.
+        F: (Nf, 3) int  — triangle indices. Tensor or numpy.
+        device: target torch.device (or "cpu"/"mps"/"cuda"). Defaults to
+                V.device if V is a tensor; else cuda > mps > cpu.
+        leaf_size: passed through to `lbvh.build_lbvh` (default 1, matching
+                   `compute_sdf`'s internal default).
+
+    Returns:
+        An `lbvh.LBVH` dataclass — opaque from the caller's perspective.
+        Reuse it across as many queries as the mesh remains unchanged.
+        Mutating V in place after this call leaves the cache stale; rebuild.
+    """
+    dev = _resolve_dev(V if isinstance(V, torch.Tensor) else None, device)
+    V_t = _to_dev(V, torch.float32, dev)
+    F_t = _to_dev(F, torch.int64, dev)
+    with torch.no_grad():
+        return lbvh.build_lbvh(V_t.detach(), F_t, leaf_size=leaf_size)
+
+
 def compute_sdf(
     V,
     F,
@@ -1119,6 +1152,7 @@ def compute_sdf(
     *,
     device=None,
     fwn_beta: float = 2.0,
+    bvh: Optional["lbvh.LBVH"] = None,
     verbose: bool = False,
 ) -> torch.Tensor:
     """Signed distance at arbitrary query points.
@@ -1133,47 +1167,45 @@ def compute_sdf(
         device: target torch.device (or "cpu"/"mps"/"cuda" string). Defaults to
                 points.device if `points` is a tensor; else cuda > mps > cpu.
         fwn_beta: Barill dipole admissibility ratio (default 2.0, ~4 digits).
+        bvh: optional pre-built LBVH from `build_bvh(V, F)`. Skips the
+             per-call build when supplied; the caller is responsible for
+             ensuring V is consistent with the bvh (no in-place mutation
+             between build and query).
 
     Returns:
         (Nq,) float32 torch tensor of signed distances on `device`. Autograd
         graph is preserved through V and points; sign is locally constant so
-        ∇sign ≡ 0 a.e. (correct for SDFs).
+        ∇sign ≡ 0 a.e. (correct for SDFs). The same ∇_V/∇_points autograd
+        properties apply whether or not `bvh` is supplied.
     """
     dev = _resolve_dev(points, device)
-    V_t = _to_dev(V, torch.float32, dev)
+    V_t = _to_dev(V, torch.float32, dev)            # live — keeps V's autograd graph
     F_t = _to_dev(F, torch.int64, dev)
     Q_t = _to_dev(points, torch.float32, dev)
 
-    # Forward path: BVH topology, BFS unsigned distance, FWN sign — all in
-    # no_grad. The BFS uses in-place scatter_reduce_(amin) on shared accumulators
-    # which trips autograd's saved-tensor versioning when stacked across
-    # iterations. Instead, we extract closest-triangle indices in no_grad and
-    # re-evaluate the final point-triangle distance with grad below.
     Nq = Q_t.shape[0]
     Nt = F_t.shape[0]
+
+    # Forward path (LBVH build + traversal + FWN sign) sits inside no_grad.
+    # The BFS uses in-place scatter_reduce_(amin) on shared accumulators which
+    # trips autograd's saved-tensor versioning when stacked across iterations;
+    # we extract closest-triangle indices in no_grad and re-evaluate the final
+    # point-triangle distance with grad below to feed Q_t and V_t into autograd.
     with torch.no_grad():
-        # build_lbvh internally calls scatter_reduce_ on V-derived AABBs/dipoles;
-        # those would also break grad on V via the same iterative-in-place issue.
-        # Topology is integer-discrete anyway, so no_grad is correct here.
-        bvh = lbvh.build_lbvh(V_t.detach(), F_t, leaf_size=1)
+        if bvh is None:
+            bvh = lbvh.build_lbvh(V_t.detach(), F_t, leaf_size=1)
 
         d_init, closest_tri = _greedy_leaf_warmstart(bvh, Q_t, verbose=verbose,
                                                      return_closest=True)
         _lbvh_unsigned_distance(bvh, Q_t, d_init, verbose=verbose,
                                 closest_tri=closest_tri)
-        # closest_tri is updated in-place; d_init holds the final unsigned distance,
-        # but we discard it and recompute differentiably from closest_tri.
-
         w = _lbvh_fwn_winding(bvh, Q_t, beta=fwn_beta, verbose=verbose)
         sign = torch.where(w.abs() > 0.5,
                            torch.full((Nq,), -1.0, dtype=torch.float32, device=dev),
                            torch.full((Nq,),  1.0, dtype=torch.float32, device=dev))
 
-    # Re-evaluate point-triangle distance on closest triangles WITH grad. This is
-    # where Q_t and V_t feed the autograd graph. The integer index path
-    # (closest_tri) is discrete and detached, which is correct.
-    closest_tri_safe = closest_tri.clamp_max(Nt - 1)        # guard sentinel
-    f = F_t.index_select(0, closest_tri_safe)               # (Nq, 3)
+    closest_tri_safe = closest_tri.clamp_max(Nt - 1)
+    f = F_t.index_select(0, closest_tri_safe)
     A = V_t.index_select(0, f[:, 0])
     B = V_t.index_select(0, f[:, 1])
     C = V_t.index_select(0, f[:, 2])
@@ -1188,6 +1220,7 @@ def compute_grad(
     *,
     device=None,
     fwn_beta: float = 2.0,
+    bvh: Optional["lbvh.LBVH"] = None,
     verbose: bool = False,
 ) -> torch.Tensor:
     """∇_xyz SDF (surface-normal direction) at query points, via autograd
@@ -1198,6 +1231,9 @@ def compute_grad(
     (eikonal); direction points from the closest surface point outward, with
     sign flipped inside the mesh.
 
+    Args:
+        bvh: optional pre-built LBVH (see `compute_sdf`).
+
     Returns:
         (Nq, 3) float32 torch tensor of gradient vectors on `device`.
     """
@@ -1206,6 +1242,7 @@ def compute_grad(
     F_t = _to_dev(F, torch.int64, dev)
     Q_t = _to_dev(points, torch.float32, dev).detach().clone().requires_grad_(True)
 
-    sdf = compute_sdf(V_t, F_t, Q_t, device=dev, fwn_beta=fwn_beta, verbose=verbose)
+    sdf = compute_sdf(V_t, F_t, Q_t, device=dev, fwn_beta=fwn_beta,
+                      bvh=bvh, verbose=verbose)
     grad, = torch.autograd.grad(sdf.sum(), Q_t, create_graph=False)
     return grad
