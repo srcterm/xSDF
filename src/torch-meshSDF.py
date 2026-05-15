@@ -115,7 +115,8 @@ def _pairwise_point_triangle_dist(P: torch.Tensor,
 
 def _greedy_leaf_warmstart(bvh: "lbvh.LBVH",
                            Q: torch.Tensor,
-                           verbose: bool = False) -> torch.Tensor:
+                           verbose: bool = False,
+                           return_closest: bool = False):
     """Tight d_best upper bound via greedy BVH descent to one leaf per query.
 
     For each query, walk root->leaf picking the child whose AABB is closer.
@@ -127,11 +128,17 @@ def _greedy_leaf_warmstart(bvh: "lbvh.LBVH",
     Bound is ≥ true nearest-surface distance (single-leaf greedy walk may
     miss the truly-closest leaf); the subsequent full BFS tightens it
     exactly.
+
+    If ``return_closest=True``, also returns the original triangle index
+    that achieved the warm-start distance per query (long, sentinel = Nt).
     """
     dev = Q.device
     Nq = Q.shape[0]
     if Nq == 0:
-        return torch.zeros(0, dtype=torch.float32, device=dev)
+        empty = torch.zeros(0, dtype=torch.float32, device=dev)
+        if return_closest:
+            return empty, torch.zeros(0, dtype=torch.long, device=dev)
+        return empty
 
     L = bvh.num_leaves
     leaf_threshold = L - 1
@@ -178,6 +185,8 @@ def _greedy_leaf_warmstart(bvh: "lbvh.LBVH",
     beg = leaf_beg.index_select(0, leaf_k)
     end = leaf_end.index_select(0, leaf_k)
     d_best = torch.full((Nq,), float("inf"), dtype=torch.float32, device=dev)
+    if return_closest:
+        closest_tri = torch.full((Nq,), Nt, dtype=torch.long, device=dev)
 
     for off in range(leaf_size):
         tri_pos = beg + off
@@ -190,11 +199,16 @@ def _greedy_leaf_warmstart(bvh: "lbvh.LBVH",
         C = V.index_select(0, f[:, 2])
         d_tri = _pairwise_point_triangle_dist(Q, A, B, C)
         d_tri = torch.where(has_tri, d_tri, torch.full_like(d_tri, float("inf")))
+        if return_closest:
+            improving = d_tri < d_best
+            closest_tri = torch.where(improving & has_tri, tri_orig, closest_tri)
         d_best = torch.minimum(d_best, d_tri)
 
     if verbose:
         print(f"[warmstart] greedy-leaf descent  d_best range=["
               f"{float(d_best.min()):.4f}, {float(d_best.max()):.4f}]")
+    if return_closest:
+        return d_best, closest_tri
     return d_best
 
 
@@ -250,7 +264,8 @@ def _lbvh_unsigned_distance(bvh: "lbvh.LBVH",
                             Q: torch.Tensor,
                             d_best: torch.Tensor,
                             verbose: bool = False,
-                            chunk_thresh: Optional[int] = None) -> torch.Tensor:
+                            chunk_thresh: Optional[int] = None,
+                            closest_tri: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Batched BFS LBVH traversal producing unsigned distance.
 
     Replaces the per-query state machine with a worklist of (query, node)
@@ -269,6 +284,11 @@ def _lbvh_unsigned_distance(bvh: "lbvh.LBVH",
 
     Caller must seed ``d_best`` with a tight upper bound — without it, early
     BFS levels can't prune and the worklist blows up.
+
+    If ``closest_tri`` is provided (long, shape (Nq,), seeded with Nt for
+    "no winner"), it is updated in-place alongside d_best — at the end it
+    holds the original triangle index achieving min distance per query.
+    Atomic (d, tri) tracking uses bit-packed scatter_reduce_(amin) on int64.
     """
     dev = Q.device
     Nq = Q.shape[0]
@@ -291,6 +311,16 @@ def _lbvh_unsigned_distance(bvh: "lbvh.LBVH",
 
     thresh = _resolve_chunk_thresh(dev, Nq, chunk_thresh)
     max_depth = 64      # 30-bit Morton caps depth at 30; slack for safety
+
+    # Bit-packed (d, tri) buffer for atomic amin tracking when closest_tri requested.
+    # Layout: int64 with float32 d_bits in upper 32 (monotonic for d ≥ 0 in IEEE 754),
+    # tri index in lower 32. scatter_reduce_(amin) on this picks (smallest d, smallest
+    # tri on ties). Sentinel for "no triangle" is the int Nt (one past last valid).
+    track_closest = closest_tri is not None
+    if track_closest:
+        TRI_MASK = (1 << 32) - 1
+        d_bits = d_best.view(torch.int32).to(torch.int64) << 32
+        packed_dst = d_bits | (closest_tri & TRI_MASK)
 
     # Initial worklist: split Q into chunks of ≤ thresh, each rooted at node 0.
     chunks = []
@@ -341,6 +371,9 @@ def _lbvh_unsigned_distance(bvh: "lbvh.LBVH",
                 end = leaf_end.index_select(0, leaf_k)
                 pts = p.index_select(0, sub_leaf)
                 best_upd = best_pair.index_select(0, sub_leaf)
+                if track_closest:
+                    local_winner_tri = torch.full((sub_leaf.numel(),), Nt,
+                                                   dtype=torch.long, device=dev)
 
                 # Always run all leaf_size offsets; has_tri gates per-pair.
                 for off in range(leaf_size):
@@ -354,9 +387,20 @@ def _lbvh_unsigned_distance(bvh: "lbvh.LBVH",
                     C = V.index_select(0, f[:, 2])
                     d_tri = _pairwise_point_triangle_dist(pts, A, B, C)
                     d_tri = torch.where(has_tri, d_tri, torch.full_like(d_tri, float("inf")))
+                    if track_closest:
+                        improving = (d_tri < best_upd) & has_tri
+                        local_winner_tri = torch.where(improving, tri_orig, local_winner_tri)
                     best_upd = torch.minimum(best_upd, d_tri)
 
                 lbvh._scatter_amin(d_best, leaf_q_long, best_upd)
+                if track_closest:
+                    # Pack (best_upd, local_winner_tri) and amin-scatter into packed_dst.
+                    # IEEE 754 non-negative-float bits are monotonic, so amin on the
+                    # int64-packed value picks (smaller d, smaller tri on ties).
+                    pack_upd = (best_upd.view(torch.int32).to(torch.int64) << 32) \
+                               | (local_winner_tri & TRI_MASK)
+                    packed_dst.scatter_reduce_(0, leaf_q_long, pack_upd,
+                                                'amin', include_self=True)
 
             # ---- Expand live internal pairs to (left, right) children ----
             expand = live & ~is_leaf
@@ -400,6 +444,13 @@ def _lbvh_unsigned_distance(bvh: "lbvh.LBVH",
     if verbose:
         print(f"[lbvh bfs] max depth={max_depth_reached}  peak worklist={peak_worklist}  "
               f"peak chunks={peak_chunks}  thresh={thresh}")
+
+    if track_closest:
+        # Decode lower 32 bits of packed_dst as int32 (truncating cast preserves the
+        # bit pattern), then to long; the Nt sentinel (set in caller-supplied seed)
+        # shouldn't survive if BFS visited every query at least once.
+        decoded = (packed_dst & TRI_MASK).to(torch.int32).to(torch.long)
+        closest_tri.copy_(decoded)
 
     return d_best
 
@@ -830,7 +881,7 @@ def _flood_fill_gradient_consistent(S: torch.Tensor,
     return S
 
 
-def mesh_to_sdf_torch_v2(
+def mesh_to_sdf_tensor_v2(
     V_np,
     F_np,
     x_coords: np.ndarray,
@@ -843,7 +894,15 @@ def mesh_to_sdf_torch_v2(
     cos_theta_min: float = 0.8,
     verbose: bool = True,
 ) -> SDFResult:
-    """LBVH + Barill FWN SDF pipeline entry point.
+    """LBVH + Barill FWN SDF pipeline — torch-tensor result variant.
+
+    Same pipeline as mesh_to_sdf_torch_v2 (which is the numpy-result wrapper);
+    skips the .cpu().numpy() conversion so phi remains a torch tensor on
+    `device`. The flood-fill + sign-assignment stages still produce a discrete
+    int8 sign field (sign is locally constant in any SDF, so its gradient is
+    zero a.e. — that's mathematically correct), so this variant is "tensor in,
+    tensor out" rather than fully autograd-differentiable. Use ``compute_sdf``
+    for the autograd-aware point-query path.
 
     Pipeline:
       1. Build LBVH (Karras 2012) on device.
@@ -991,4 +1050,199 @@ def mesh_to_sdf_torch_v2(
         if abs(dx_x - dx_y) < 1e-6 and abs(dx_x - dx_z) < 1e-6:
             dx_out = dx_x
 
-    return SDFResult(phi.cpu().numpy(), origin.numpy(), dx_out, (nx, ny, nz))
+    return SDFResult(phi, origin, dx_out, (nx, ny, nz))
+
+
+def mesh_to_sdf_torch_v2(
+    V_np,
+    F_np,
+    x_coords: np.ndarray,
+    y_coords: np.ndarray,
+    z_coords: np.ndarray,
+    *,
+    device: Optional[str] = None,
+    fwn_beta: float = 2.0,
+    fwn_band_width_cells: float = 3.0,
+    cos_theta_min: float = 0.8,
+    verbose: bool = True,
+) -> SDFResult:
+    """LBVH + Barill FWN SDF pipeline — numpy-result variant (legacy entry).
+
+    Wraps mesh_to_sdf_tensor_v2; converts phi/origin to numpy for back-compat
+    with xSDF.py's HDF5 writer and any caller already consuming numpy arrays.
+    """
+    res = mesh_to_sdf_tensor_v2(
+        V_np, F_np, x_coords, y_coords, z_coords,
+        device=device,
+        fwn_beta=fwn_beta,
+        fwn_band_width_cells=fwn_band_width_cells,
+        cos_theta_min=cos_theta_min,
+        verbose=verbose,
+    )
+    return SDFResult(res.phi.cpu().numpy(), res.origin.numpy(),
+                     res.dx, res.grid_shape)
+
+
+# ============================================================================
+# Public point-query API: compute_sdf + compute_grad.
+# Returns torch tensors on-device; autograd graph is preserved end-to-end so
+# callers may backprop through points (∇_xyz SDF) or V (∇_V SDF). Sign is
+# locally constant so its gradient is zero a.e. — correct for SDFs.
+# ============================================================================
+
+
+def _resolve_dev(points, device) -> torch.device:
+    """Pick a target torch.device given the `device` arg and the `points` input."""
+    if device is None:
+        if isinstance(points, torch.Tensor):
+            return points.device
+        return pick_device(None)
+    if isinstance(device, torch.device):
+        return device
+    return pick_device(str(device))
+
+
+def _to_dev(t, dtype, dev):
+    """Move t (Tensor or array-like) to `dev` with `dtype`. Avoids unnecessary
+    copies when t is already on dev/dtype, preserving any autograd graph."""
+    if isinstance(t, torch.Tensor):
+        if t.device == dev and t.dtype == dtype:
+            return t
+        return t.to(device=dev, dtype=dtype)
+    return torch.as_tensor(t, dtype=dtype, device=dev)
+
+
+def build_bvh(V, F, *, device=None, leaf_size: int = 1) -> "lbvh.LBVH":
+    """Pre-build the LBVH for repeated queries on the same mesh.
+
+    Pass the returned object as `bvh=` to `compute_sdf` / `compute_grad`
+    on subsequent calls to skip the per-call build. Sub-millisecond on
+    procedural meshes; ~50–100 ms on ShapeNet-scale meshes — saved on
+    every reuse.
+
+    The build doesn't depend on autograd, so V is detached internally;
+    callers can still pass V with `requires_grad=True` to `compute_sdf`
+    / `compute_grad` and ∇_V will flow through the per-call differentiable
+    re-evaluation step.
+
+    Args:
+        V: (Nv, 3) float — mesh vertices. Tensor or numpy.
+        F: (Nf, 3) int  — triangle indices. Tensor or numpy.
+        device: target torch.device (or "cpu"/"mps"/"cuda"). Defaults to
+                V.device if V is a tensor; else cuda > mps > cpu.
+        leaf_size: passed through to `lbvh.build_lbvh` (default 1, matching
+                   `compute_sdf`'s internal default).
+
+    Returns:
+        An `lbvh.LBVH` dataclass — opaque from the caller's perspective.
+        Reuse it across as many queries as the mesh remains unchanged.
+        Mutating V in place after this call leaves the cache stale; rebuild.
+    """
+    dev = _resolve_dev(V if isinstance(V, torch.Tensor) else None, device)
+    V_t = _to_dev(V, torch.float32, dev)
+    F_t = _to_dev(F, torch.int64, dev)
+    with torch.no_grad():
+        return lbvh.build_lbvh(V_t.detach(), F_t, leaf_size=leaf_size)
+
+
+def compute_sdf(
+    V,
+    F,
+    points,
+    *,
+    device=None,
+    fwn_beta: float = 2.0,
+    bvh: Optional["lbvh.LBVH"] = None,
+    verbose: bool = False,
+) -> torch.Tensor:
+    """Signed distance at arbitrary query points.
+
+    Pipeline: build LBVH (Karras 2012), greedy-leaf warm-start + chunked-BFS
+    LBVH traversal for unsigned |d|, Barill hierarchical FWN for sign.
+
+    Args:
+        V: (Nv, 3) float — mesh vertices. Tensor or numpy.
+        F: (Nf, 3) int  — triangle indices. Tensor or numpy.
+        points: (Nq, 3) float — query points. Tensor or numpy.
+        device: target torch.device (or "cpu"/"mps"/"cuda" string). Defaults to
+                points.device if `points` is a tensor; else cuda > mps > cpu.
+        fwn_beta: Barill dipole admissibility ratio (default 2.0, ~4 digits).
+        bvh: optional pre-built LBVH from `build_bvh(V, F)`. Skips the
+             per-call build when supplied; the caller is responsible for
+             ensuring V is consistent with the bvh (no in-place mutation
+             between build and query).
+
+    Returns:
+        (Nq,) float32 torch tensor of signed distances on `device`. Autograd
+        graph is preserved through V and points; sign is locally constant so
+        ∇sign ≡ 0 a.e. (correct for SDFs). The same ∇_V/∇_points autograd
+        properties apply whether or not `bvh` is supplied.
+    """
+    dev = _resolve_dev(points, device)
+    V_t = _to_dev(V, torch.float32, dev)            # live — keeps V's autograd graph
+    F_t = _to_dev(F, torch.int64, dev)
+    Q_t = _to_dev(points, torch.float32, dev)
+
+    Nq = Q_t.shape[0]
+    Nt = F_t.shape[0]
+
+    # Forward path (LBVH build + traversal + FWN sign) sits inside no_grad.
+    # The BFS uses in-place scatter_reduce_(amin) on shared accumulators which
+    # trips autograd's saved-tensor versioning when stacked across iterations;
+    # we extract closest-triangle indices in no_grad and re-evaluate the final
+    # point-triangle distance with grad below to feed Q_t and V_t into autograd.
+    with torch.no_grad():
+        if bvh is None:
+            bvh = lbvh.build_lbvh(V_t.detach(), F_t, leaf_size=1)
+
+        d_init, closest_tri = _greedy_leaf_warmstart(bvh, Q_t, verbose=verbose,
+                                                     return_closest=True)
+        _lbvh_unsigned_distance(bvh, Q_t, d_init, verbose=verbose,
+                                closest_tri=closest_tri)
+        w = _lbvh_fwn_winding(bvh, Q_t, beta=fwn_beta, verbose=verbose)
+        sign = torch.where(w.abs() > 0.5,
+                           torch.full((Nq,), -1.0, dtype=torch.float32, device=dev),
+                           torch.full((Nq,),  1.0, dtype=torch.float32, device=dev))
+
+    closest_tri_safe = closest_tri.clamp_max(Nt - 1)
+    f = F_t.index_select(0, closest_tri_safe)
+    A = V_t.index_select(0, f[:, 0])
+    B = V_t.index_select(0, f[:, 1])
+    C = V_t.index_select(0, f[:, 2])
+    d_unsigned = _pairwise_point_triangle_dist(Q_t, A, B, C)
+    return sign * d_unsigned
+
+
+def compute_grad(
+    V,
+    F,
+    points,
+    *,
+    device=None,
+    fwn_beta: float = 2.0,
+    bvh: Optional["lbvh.LBVH"] = None,
+    verbose: bool = False,
+) -> torch.Tensor:
+    """∇_xyz SDF (surface-normal direction) at query points, via autograd
+    backward on `compute_sdf`.
+
+    Single forward + single backward through the same code path as compute_sdf —
+    no second implementation of "what's the gradient". Magnitude is ≈ 1
+    (eikonal); direction points from the closest surface point outward, with
+    sign flipped inside the mesh.
+
+    Args:
+        bvh: optional pre-built LBVH (see `compute_sdf`).
+
+    Returns:
+        (Nq, 3) float32 torch tensor of gradient vectors on `device`.
+    """
+    dev = _resolve_dev(points, device)
+    V_t = _to_dev(V, torch.float32, dev)
+    F_t = _to_dev(F, torch.int64, dev)
+    Q_t = _to_dev(points, torch.float32, dev).detach().clone().requires_grad_(True)
+
+    sdf = compute_sdf(V_t, F_t, Q_t, device=dev, fwn_beta=fwn_beta,
+                      bvh=bvh, verbose=verbose)
+    grad, = torch.autograd.grad(sdf.sum(), Q_t, create_graph=False)
+    return grad

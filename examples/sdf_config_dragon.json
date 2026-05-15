@@ -1,0 +1,63 @@
+{
+  "description": "Stanford dragon — uniform grid, ~3M voxels",
+
+  "_comments": {
+    "mesh_source": "Cached at meshes/dragon_vrip.ply by tests/bench_stanford.fetch('dragon'). Run that once if missing.",
+    "watertight_warning": "dragon_vrip.ply is non-watertight (F=871,414). Bench skips pymeshfix at F>250k, so flood-fill may misbehave near holes. Sign quality is acceptable for visualization but not bit-exact.",
+    "domain": "Mesh bbox [-0.108, 0.053, -0.050] -> [0.097, 0.197, 0.041] with ~10% pad of max extent (~0.0205)."
+  },
+
+  "output": {
+    "save_name": "dragon_sdf.h5",
+    "visualize": false
+  },
+
+  "domain": {
+    "bounds": {
+      "x": [-0.13, 0.12],
+      "y": [0.03, 0.22],
+      "z": [-0.07, 0.07]
+    }
+  },
+
+  "geometry": {
+    "type": "stl",
+    "path": "meshes/dragon_vrip.ply",
+    "transformations": {
+      "scale": 1.0,
+      "translate": [0.0, 0.0, 0.0],
+      "rotate": [0.0, 0.0, 0.0]
+    }
+  },
+
+  "grid": {
+    "target_min_size": 0.0013,
+    "stretch_factor": 1.0,
+    "stretch_axes": {
+      "x": {
+        "center": 0.0,
+        "dx_min": null,
+        "r_max": null
+      },
+      "y": {
+        "center": 0.125,
+        "dx_min": null,
+        "r_max": null
+      },
+      "z": {
+        "center": 0.0,
+        "dx_min": null,
+        "r_max": null
+      }
+    },
+    "preview_stretch": false
+  },
+
+  "backend": {
+    "method": "torch",
+    "memory_budget_gb": 8.0,
+    "torch": {
+      "device": "mps"
+    }
+  }
+}

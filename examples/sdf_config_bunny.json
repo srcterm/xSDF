@@ -1,0 +1,62 @@
+{
+  "description": "Stanford bunny — uniform grid, ~1.7M voxels",
+
+  "_comments": {
+    "mesh_source": "meshes/bun_zipper_repaired.ply — pymeshfix-repaired copy of the Stanford bunny scan (closes the open-bottom hole). Original at meshes/bun_zipper.ply is non-watertight and causes flood-fill sign leaks; do not use directly.",
+    "domain": "Mesh bbox [-0.095, 0.033, -0.062] -> [0.061, 0.187, 0.059] with ~10% pad of max extent (~0.0156)."
+  },
+
+  "output": {
+    "save_name": "bunny_sdf.h5",
+    "visualize": false
+  },
+
+  "domain": {
+    "bounds": {
+      "x": [-0.11, 0.08],
+      "y": [0.02, 0.21],
+      "z": [-0.08, 0.08]
+    }
+  },
+
+  "geometry": {
+    "type": "stl",
+    "path": "meshes/bun_zipper_repaired.ply",
+    "transformations": {
+      "scale": 1.0,
+      "translate": [0.0, 0.0, 0.0],
+      "rotate": [0.0, 0.0, 0.0]
+    }
+  },
+
+  "grid": {
+    "target_min_size": 0.0015,
+    "stretch_factor": 1.0,
+    "stretch_axes": {
+      "x": {
+        "center": 0.0,
+        "dx_min": null,
+        "r_max": null
+      },
+      "y": {
+        "center": 0.11,
+        "dx_min": null,
+        "r_max": null
+      },
+      "z": {
+        "center": 0.0,
+        "dx_min": null,
+        "r_max": null
+      }
+    },
+    "preview_stretch": false
+  },
+
+  "backend": {
+    "method": "torch",
+    "memory_budget_gb": 8.0,
+    "torch": {
+      "device": "cpu"
+    }
+  }
+}

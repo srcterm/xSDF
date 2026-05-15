@@ -15,6 +15,7 @@ xSDF is very fast. It's fully vectorized and use a mix of various accelerated me
 - **Gradient-consistent flood fill**, FWN pass only runs where needed (around geom. + narrow band) and not on the entire grid (large domain accelerator).
 - **Geometric grid stretching**: uniform, center-point single-stretch, or piecewise multi-segment per-axis.
 - **HDF5 output** (`.h5`) with grid metadata (`levelset`, `x/y/z_coords`, `origin`, `grid_size`, `non_uniform_grid`).
+- **Differentiable point-query API** (`compute_sdf`, `compute_grad`, `build_bvh`) — autograd flows end-to-end through both query points and mesh vertices, no grid required. Pre-build the LBVH is pre-built fast repeated queries on the same mesh.
 
 #### Speed & Performance
 
@@ -223,13 +224,65 @@ See `/examples` for various config examples using the Ahmed body case for the di
 </p>
 
 
+## Differentiable point queries
+
+For auto-decoder training and shape optimization — `src/torch-meshSDF.py` exposes two functions that evaluate the SDF and its gradient at arbitrary query points:
+
+```python
+from torch_meshSDF import compute_sdf, compute_grad
+
+# V: (Nv, 3) float   F: (Nf, 3) int   points: (Nq, 3) float   (np or torch)
+sdf  = compute_sdf(V, F, points, device='mps')      # (Nq,)   float
+grad = compute_grad(V, F, points, device='mps')     # (Nq, 3) float, |grad| ≈ 1
+```
+
+Both reuse the same LBVH + FWN path as the grid backend so that the tree is not built multiple times and no cached state. `compute_grad` is one `torch.autograd.grad` backward through `compute_sdf`, so the two cannot drift out of sync.
+
+The pipeline is **end-to-end differentiable**. The autograd graph is preserved through both `V` (mesh vertices) and `points`, so callers can backprop through SDF values:
+
+```python
+V = torch.tensor(V_np, requires_grad=True)
+sdf = compute_sdf(V, F, points)                     # autograd-tracked
+loss = (sdf - target).pow(2).mean()
+loss.backward()                                     # ∇_V populated
+```
+
+<!-- Discrete operations (Morton-sort permutation, integer index paths, sign step from FWN) break grad correctly on the topology side, while AABB and Barill dipole aggregation use autograd-safe `scatter_reduce_(amin/amax)` and `scatter_add_` so grad flows through `V` to the geometric values. -->
+
+#### Repeated queries on the same mesh
+
+When the same mesh is queried more than once, such as during an optimization loops, pre-build the LBVH and pass it back via `bvh=`:
+
+```python
+from torch_meshSDF import build_bvh, compute_sdf, compute_grad
+
+bvh = build_bvh(V, F, device='mps')                  # O(Nt log Nt), once
+for step in range(n_steps):
+    pts = sampler.sample(...)
+    sdf  = compute_sdf(V, F, pts, bvh=bvh)            # skips the rebuild
+    grad = compute_grad(V, F, pts, bvh=bvh)
+```
+<!-- 
+`build_bvh` returns the underlying `lbvh.LBVH` object directly — no bespoke wrapper. ∇_V and ∇_xyz both flow through the cached path because `V` is passed live every call; only the LBVH topology and FWN dipole fields are reused. Bunny-scale (70k tris, 1024 query pts/batch, 20 batches): **1.73× faster** end-to-end, bit-equal results.
+
+> Caller is responsible for not mutating `V` in place between `build_bvh` and the next `compute_sdf(..., bvh=...)` call — the cached AABBs go stale silently. Rebuild after any V update. -->
+
+| arg | type | default | meaning |
+|-----|------|---------|---------|
+| `V` | `(Nv,3)` float | — | mesh vertices (np or torch) |
+| `F` | `(Nf,3)` int   | — | triangles |
+| `points` | `(Nq,3)` float | — | query points |
+| `device` | str / torch.device | `points.device` if tensor, else `cuda > mps > cpu` | compute device |
+| `fwn_beta` | float | `2.0` | Barill admissibility ratio (~4 digits FWN accuracy) |
+| `bvh` | `lbvh.LBVH` | `None` | pre-built LBVH from `build_bvh(V, F)`; skips per-call build |
+
+
 ## Final Note
 
-Hopefully this code may be useful — bugs and issues, just let me know!
+Hopefully this code may be useful for more than just fast SDF generation — bugs and issues, just let me know!
 
 ## To Dos
 - Speed tests on CUDA. 
-- Gradient exposure.
 - Surface Area Heuristic (SAH), fix for MPS dispatch overhead as LBVH -> LHBVH?
 
 
